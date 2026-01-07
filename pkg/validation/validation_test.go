@@ -46,7 +46,7 @@ func TestHasSchema(t *testing.T) {
 		t.Error("HasSchema should return false for non-existent schema")
 	}
 
-	v.LoadSchema("test", map[string]interface{}{"type": "object"})
+	_ = v.LoadSchema("test", map[string]interface{}{"type": "object"})
 
 	if !v.HasSchema("test") {
 		t.Error("HasSchema should return true for loaded schema")
@@ -64,7 +64,7 @@ func TestGetSchema(t *testing.T) {
 
 	// Load and retrieve
 	schema := map[string]interface{}{"type": "object"}
-	v.LoadSchema("test", schema)
+	_ = v.LoadSchema("test", schema)
 
 	retrieved, err := v.GetSchema("test")
 	if err != nil {
@@ -96,7 +96,7 @@ func TestValidateRequired(t *testing.T) {
 		},
 		"required": []interface{}{"name", "email"},
 	}
-	v.LoadSchema("users", schema)
+	_ = v.LoadSchema("users", schema)
 
 	// Missing required field
 	valid, errors := v.Validate("users", map[string]interface{}{"name": "Alice"})
@@ -128,7 +128,7 @@ func TestValidateTypes(t *testing.T) {
 			"active": map[string]interface{}{"type": "boolean"},
 		},
 	}
-	v.LoadSchema("users", schema)
+	_ = v.LoadSchema("users", schema)
 
 	// Correct types
 	valid, errors := v.Validate("users", map[string]interface{}{
@@ -162,7 +162,7 @@ func TestValidateStringConstraints(t *testing.T) {
 			},
 		},
 	}
-	v.LoadSchema("users", schema)
+	_ = v.LoadSchema("users", schema)
 
 	// Too short
 	valid, errors := v.Validate("users", map[string]interface{}{"username": "ab"})
@@ -207,7 +207,7 @@ func TestValidateNumberConstraints(t *testing.T) {
 			},
 		},
 	}
-	v.LoadSchema("people", schema)
+	_ = v.LoadSchema("people", schema)
 
 	// Below minimum
 	valid, errors := v.Validate("people", map[string]interface{}{"age": float64(-5)})
@@ -240,7 +240,7 @@ func TestValidateEnum(t *testing.T) {
 			},
 		},
 	}
-	v.LoadSchema("users", schema)
+	_ = v.LoadSchema("users", schema)
 
 	// Valid enum value
 	valid, errors := v.Validate("users", map[string]interface{}{"status": "active"})
@@ -272,7 +272,7 @@ func TestValidateMultipleErrors(t *testing.T) {
 		},
 		"required": []interface{}{"email"},
 	}
-	v.LoadSchema("users", schema)
+	_ = v.LoadSchema("users", schema)
 
 	// Multiple validation errors
 	valid, errors := v.Validate("users", map[string]interface{}{
@@ -379,7 +379,7 @@ func TestValidateAllowsExtraProperties(t *testing.T) {
 			"name": map[string]interface{}{"type": "string"},
 		},
 	}
-	v.LoadSchema("users", schema)
+	_ = v.LoadSchema("users", schema)
 
 	// Extra properties should be allowed by default
 	valid, errors := v.Validate("users", map[string]interface{}{
@@ -401,7 +401,7 @@ func TestValidateIntegerForNumber(t *testing.T) {
 			"count": map[string]interface{}{"type": "number"},
 		},
 	}
-	v.LoadSchema("items", schema)
+	_ = v.LoadSchema("items", schema)
 
 	// Integer should be accepted for number type
 	// Note: JSON unmarshals to float64, but we test the int->number coercion

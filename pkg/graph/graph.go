@@ -719,7 +719,7 @@ func (g *IndexedGraph) GetNodeInfo(nodeID string) (*NodeInfo, error) {
 	entityID := 0
 	if len(parts) == 2 {
 		entity = parts[0]
-		fmt.Sscanf(parts[1], "%d", &entityID)
+		_, _ = fmt.Sscanf(parts[1], "%d", &entityID)
 	}
 
 	// Copy maps

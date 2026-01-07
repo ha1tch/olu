@@ -7,6 +7,22 @@ import (
 	"testing"
 )
 
+// mustAddNode adds a node, failing the test if it errors
+func mustAddNode(t *testing.T, g *IndexedGraph, id, entityType string) {
+	t.Helper()
+	if err := g.AddNode(id, entityType); err != nil {
+		t.Fatalf("AddNode(%s, %s) failed: %v", id, entityType, err)
+	}
+}
+
+// mustAddEdge adds an edge, failing the test if it errors
+func mustAddEdge(t *testing.T, g *IndexedGraph, from, to, relType string) {
+	t.Helper()
+	if err := g.AddEdge(from, to, relType); err != nil {
+		t.Fatalf("AddEdge(%s, %s, %s) failed: %v", from, to, relType, err)
+	}
+}
+
 func TestNewIndexedGraph(t *testing.T) {
 	g := NewIndexedGraph()
 	if g == nil {
@@ -67,8 +83,8 @@ func TestAddRemoveEdge(t *testing.T) {
 	g := NewIndexedGraph()
 
 	// Add nodes first
-	g.AddNode("users:1", "users")
-	g.AddNode("users:2", "users")
+	mustAddNode(t, g, "users:1", "users")
+	mustAddNode(t, g, "users:2", "users")
 
 	// Add edge
 	err := g.AddEdge("users:1", "users:2", "FOLLOWS")
@@ -122,11 +138,11 @@ func TestAddRemoveEdge(t *testing.T) {
 func TestGetNeighbors(t *testing.T) {
 	g := NewIndexedGraph()
 
-	g.AddNode("users:1", "users")
-	g.AddNode("users:2", "users")
-	g.AddNode("users:3", "users")
-	g.AddEdge("users:1", "users:2", "FOLLOWS")
-	g.AddEdge("users:1", "users:3", "KNOWS")
+	mustAddNode(t, g, "users:1", "users")
+	mustAddNode(t, g, "users:2", "users")
+	mustAddNode(t, g, "users:3", "users")
+	mustAddEdge(t, g, "users:1", "users:2", "FOLLOWS")
+	mustAddEdge(t, g, "users:1", "users:3", "KNOWS")
 
 	neighbors, err := g.GetNeighbors("users:1")
 	if err != nil {
@@ -155,11 +171,11 @@ func TestGetNeighbors(t *testing.T) {
 func TestGetIncomingEdges(t *testing.T) {
 	g := NewIndexedGraph()
 
-	g.AddNode("users:1", "users")
-	g.AddNode("users:2", "users")
-	g.AddNode("users:3", "users")
-	g.AddEdge("users:1", "users:3", "FOLLOWS")
-	g.AddEdge("users:2", "users:3", "FOLLOWS")
+	mustAddNode(t, g, "users:1", "users")
+	mustAddNode(t, g, "users:2", "users")
+	mustAddNode(t, g, "users:3", "users")
+	mustAddEdge(t, g, "users:1", "users:3", "FOLLOWS")
+	mustAddEdge(t, g, "users:2", "users:3", "FOLLOWS")
 
 	incoming, err := g.GetIncomingEdges("users:3")
 	if err != nil {
@@ -182,13 +198,13 @@ func TestFindPath(t *testing.T) {
 	g := NewIndexedGraph()
 
 	// Create chain: 1 -> 2 -> 3 -> 4
-	g.AddNode("n:1", "node")
-	g.AddNode("n:2", "node")
-	g.AddNode("n:3", "node")
-	g.AddNode("n:4", "node")
-	g.AddEdge("n:1", "n:2", "NEXT")
-	g.AddEdge("n:2", "n:3", "NEXT")
-	g.AddEdge("n:3", "n:4", "NEXT")
+	_ = g.AddNode("n:1", "node")
+	_ = g.AddNode("n:2", "node")
+	_ = g.AddNode("n:3", "node")
+	_ = g.AddNode("n:4", "node")
+	_ = g.AddEdge("n:1", "n:2", "NEXT")
+	_ = g.AddEdge("n:2", "n:3", "NEXT")
+	_ = g.AddEdge("n:3", "n:4", "NEXT")
 
 	// Find path 1 -> 4
 	path, err := g.FindPath("n:1", "n:4", 10)
@@ -216,7 +232,7 @@ func TestFindPath(t *testing.T) {
 	}
 
 	// No path exists
-	g.AddNode("n:5", "node") // Isolated node
+	_ = g.AddNode("n:5", "node") // Isolated node
 	path, err = g.FindPath("n:1", "n:5", 10)
 	if err == nil {
 		t.Error("Expected error when no path exists")
@@ -228,10 +244,10 @@ func TestFindPathMaxDepth(t *testing.T) {
 
 	// Create chain: 1 -> 2 -> 3 -> 4 -> 5
 	for i := 1; i <= 5; i++ {
-		g.AddNode(fmt.Sprintf("n:%d", i), "node")
+		_ = g.AddNode(fmt.Sprintf("n:%d", i), "node")
 	}
 	for i := 1; i < 5; i++ {
-		g.AddEdge(fmt.Sprintf("n:%d", i), fmt.Sprintf("n:%d", i+1), "NEXT")
+		_ = g.AddEdge(fmt.Sprintf("n:%d", i), fmt.Sprintf("n:%d", i+1), "NEXT")
 	}
 
 	// Should find path with sufficient depth
@@ -253,11 +269,11 @@ func TestFindPathMaxDepth(t *testing.T) {
 func TestPathExists(t *testing.T) {
 	g := NewIndexedGraph()
 
-	g.AddNode("a:1", "a")
-	g.AddNode("b:1", "b")
-	g.AddNode("c:1", "c")
-	g.AddEdge("a:1", "b:1", "REL")
-	g.AddEdge("b:1", "c:1", "REL")
+	_ = g.AddNode("a:1", "a")
+	_ = g.AddNode("b:1", "b")
+	_ = g.AddNode("c:1", "c")
+	_ = g.AddEdge("a:1", "b:1", "REL")
+	_ = g.AddEdge("b:1", "c:1", "REL")
 
 	// Path exists
 	exists, depth, err := g.PathExists("a:1", "c:1", 10)
@@ -272,7 +288,7 @@ func TestPathExists(t *testing.T) {
 	}
 
 	// No path
-	g.AddNode("d:1", "d") // Isolated
+	_ = g.AddNode("d:1", "d") // Isolated
 	exists, _, err = g.PathExists("a:1", "d:1", 10)
 	if err != nil {
 		t.Fatalf("PathExists failed: %v", err)
@@ -295,18 +311,18 @@ func TestHasCycle(t *testing.T) {
 	g := NewIndexedGraph()
 
 	// Acyclic graph
-	g.AddNode("n:1", "node")
-	g.AddNode("n:2", "node")
-	g.AddNode("n:3", "node")
-	g.AddEdge("n:1", "n:2", "NEXT")
-	g.AddEdge("n:2", "n:3", "NEXT")
+	_ = g.AddNode("n:1", "node")
+	_ = g.AddNode("n:2", "node")
+	_ = g.AddNode("n:3", "node")
+	_ = g.AddEdge("n:1", "n:2", "NEXT")
+	_ = g.AddEdge("n:2", "n:3", "NEXT")
 
 	if g.HasCycle() {
 		t.Error("Graph should not have cycle")
 	}
 
 	// Add cycle
-	g.AddEdge("n:3", "n:1", "BACK")
+	_ = g.AddEdge("n:3", "n:1", "BACK")
 
 	if !g.HasCycle() {
 		t.Error("Graph should have cycle after adding back edge")
@@ -317,15 +333,15 @@ func TestCommonNeighbors(t *testing.T) {
 	g := NewIndexedGraph()
 
 	// Setup: A -> C, A -> D, B -> C, B -> E
-	g.AddNode("a:1", "a")
-	g.AddNode("b:1", "b")
-	g.AddNode("c:1", "c")
-	g.AddNode("d:1", "d")
-	g.AddNode("e:1", "e")
-	g.AddEdge("a:1", "c:1", "REL")
-	g.AddEdge("a:1", "d:1", "REL")
-	g.AddEdge("b:1", "c:1", "REL")
-	g.AddEdge("b:1", "e:1", "REL")
+	_ = g.AddNode("a:1", "a")
+	_ = g.AddNode("b:1", "b")
+	_ = g.AddNode("c:1", "c")
+	_ = g.AddNode("d:1", "d")
+	_ = g.AddNode("e:1", "e")
+	_ = g.AddEdge("a:1", "c:1", "REL")
+	_ = g.AddEdge("a:1", "d:1", "REL")
+	_ = g.AddEdge("b:1", "c:1", "REL")
+	_ = g.AddEdge("b:1", "e:1", "REL")
 
 	common, err := g.CommonNeighbors("a:1", "b:1")
 	if err != nil {
@@ -340,8 +356,8 @@ func TestCommonNeighbors(t *testing.T) {
 	}
 
 	// No common neighbors
-	g.AddNode("f:1", "f")
-	g.AddEdge("f:1", "d:1", "REL") // f -> d only
+	_ = g.AddNode("f:1", "f")
+	_ = g.AddEdge("f:1", "d:1", "REL") // f -> d only
 	common, err = g.CommonNeighbors("b:1", "f:1")
 	if err != nil {
 		t.Fatalf("CommonNeighbors failed: %v", err)
@@ -354,11 +370,11 @@ func TestCommonNeighbors(t *testing.T) {
 func TestGetNodesByType(t *testing.T) {
 	g := NewIndexedGraph()
 
-	g.AddNode("users:1", "users")
-	g.AddNode("users:2", "users")
-	g.AddNode("posts:1", "posts")
-	g.AddNode("posts:2", "posts")
-	g.AddNode("posts:3", "posts")
+	_ = g.AddNode("users:1", "users")
+	_ = g.AddNode("users:2", "users")
+	_ = g.AddNode("posts:1", "posts")
+	_ = g.AddNode("posts:2", "posts")
+	_ = g.AddNode("posts:3", "posts")
 
 	users := g.GetNodesByType("users")
 	if len(users) != 2 {
@@ -379,12 +395,12 @@ func TestGetNodesByType(t *testing.T) {
 func TestGetDegree(t *testing.T) {
 	g := NewIndexedGraph()
 
-	g.AddNode("n:1", "node")
-	g.AddNode("n:2", "node")
-	g.AddNode("n:3", "node")
-	g.AddEdge("n:1", "n:2", "OUT")
-	g.AddEdge("n:1", "n:3", "OUT")
-	g.AddEdge("n:3", "n:1", "IN")
+	_ = g.AddNode("n:1", "node")
+	_ = g.AddNode("n:2", "node")
+	_ = g.AddNode("n:3", "node")
+	_ = g.AddEdge("n:1", "n:2", "OUT")
+	_ = g.AddEdge("n:1", "n:3", "OUT")
+	_ = g.AddEdge("n:3", "n:1", "IN")
 
 	degree, err := g.GetDegree("n:1")
 	if err != nil {
@@ -405,12 +421,12 @@ func TestGetDegree(t *testing.T) {
 func TestGetNodeInfo(t *testing.T) {
 	g := NewIndexedGraph()
 
-	g.AddNode("users:42", "users")
-	g.AddNode("posts:1", "posts")
-	g.AddNode("posts:2", "posts")
-	g.AddEdge("users:42", "posts:1", "AUTHORED")
-	g.AddEdge("users:42", "posts:2", "AUTHORED")
-	g.AddEdge("posts:1", "users:42", "WRITTEN_BY")
+	_ = g.AddNode("users:42", "users")
+	_ = g.AddNode("posts:1", "posts")
+	_ = g.AddNode("posts:2", "posts")
+	_ = g.AddEdge("users:42", "posts:1", "AUTHORED")
+	_ = g.AddEdge("users:42", "posts:2", "AUTHORED")
+	_ = g.AddEdge("posts:1", "users:42", "WRITTEN_BY")
 
 	info, err := g.GetNodeInfo("users:42")
 	if err != nil {
@@ -434,11 +450,11 @@ func TestGetNodeInfo(t *testing.T) {
 func TestSaveLoad(t *testing.T) {
 	g := NewIndexedGraph()
 
-	g.AddNode("users:1", "users")
-	g.AddNode("users:2", "users")
-	g.AddNode("posts:1", "posts")
-	g.AddEdge("users:1", "users:2", "FOLLOWS")
-	g.AddEdge("users:1", "posts:1", "AUTHORED")
+	_ = g.AddNode("users:1", "users")
+	_ = g.AddNode("users:2", "users")
+	_ = g.AddNode("posts:1", "posts")
+	_ = g.AddEdge("users:1", "users:2", "FOLLOWS")
+	_ = g.AddEdge("users:1", "posts:1", "AUTHORED")
 
 	tmpFile := "/tmp/test_graph.json"
 	defer os.Remove(tmpFile)
@@ -529,9 +545,9 @@ users:2:`
 func TestClear(t *testing.T) {
 	g := NewIndexedGraph()
 
-	g.AddNode("n:1", "node")
-	g.AddNode("n:2", "node")
-	g.AddEdge("n:1", "n:2", "REL")
+	_ = g.AddNode("n:1", "node")
+	_ = g.AddNode("n:2", "node")
+	_ = g.AddEdge("n:1", "n:2", "REL")
 
 	err := g.Clear()
 	if err != nil {
@@ -551,7 +567,7 @@ func TestConcurrentAccess(t *testing.T) {
 
 	// Pre-populate
 	for i := 0; i < 100; i++ {
-		g.AddNode(fmt.Sprintf("n:%d", i), "node")
+		_ = g.AddNode(fmt.Sprintf("n:%d", i), "node")
 	}
 
 	var wg sync.WaitGroup
@@ -594,11 +610,11 @@ func TestConcurrentAccess(t *testing.T) {
 func TestRemoveNodeCascadesEdges(t *testing.T) {
 	g := NewIndexedGraph()
 
-	g.AddNode("n:1", "node")
-	g.AddNode("n:2", "node")
-	g.AddNode("n:3", "node")
-	g.AddEdge("n:1", "n:2", "OUT")
-	g.AddEdge("n:3", "n:2", "IN")
+	_ = g.AddNode("n:1", "node")
+	_ = g.AddNode("n:2", "node")
+	_ = g.AddNode("n:3", "node")
+	_ = g.AddEdge("n:1", "n:2", "OUT")
+	_ = g.AddEdge("n:3", "n:2", "IN")
 
 	initialEdges := g.EdgeCount()
 	if initialEdges != 2 {
@@ -659,13 +675,13 @@ func TestSetCycleDetection(t *testing.T) {
 func TestCycleDetection_Ignore(t *testing.T) {
 	g := NewIndexedGraphWithCycleDetection("ignore")
 
-	g.AddNode("n:1", "node")
-	g.AddNode("n:2", "node")
-	g.AddNode("n:3", "node")
+	_ = g.AddNode("n:1", "node")
+	_ = g.AddNode("n:2", "node")
+	_ = g.AddNode("n:3", "node")
 
 	// Create a cycle: 1 -> 2 -> 3 -> 1
-	g.AddEdge("n:1", "n:2", "LINK")
-	g.AddEdge("n:2", "n:3", "LINK")
+	_ = g.AddEdge("n:1", "n:2", "LINK")
+	_ = g.AddEdge("n:2", "n:3", "LINK")
 	
 	// This creates a cycle - should succeed with ignore mode
 	err := g.AddEdge("n:3", "n:1", "LINK")
@@ -682,12 +698,12 @@ func TestCycleDetection_Ignore(t *testing.T) {
 func TestCycleDetection_Warn(t *testing.T) {
 	g := NewIndexedGraphWithCycleDetection("warn")
 
-	g.AddNode("n:1", "node")
-	g.AddNode("n:2", "node")
-	g.AddNode("n:3", "node")
+	_ = g.AddNode("n:1", "node")
+	_ = g.AddNode("n:2", "node")
+	_ = g.AddNode("n:3", "node")
 
-	g.AddEdge("n:1", "n:2", "LINK")
-	g.AddEdge("n:2", "n:3", "LINK")
+	_ = g.AddEdge("n:1", "n:2", "LINK")
+	_ = g.AddEdge("n:2", "n:3", "LINK")
 	
 	// This creates a cycle - should succeed with warn mode (just logs)
 	err := g.AddEdge("n:3", "n:1", "LINK")
@@ -704,12 +720,12 @@ func TestCycleDetection_Warn(t *testing.T) {
 func TestCycleDetection_Error(t *testing.T) {
 	g := NewIndexedGraphWithCycleDetection("error")
 
-	g.AddNode("n:1", "node")
-	g.AddNode("n:2", "node")
-	g.AddNode("n:3", "node")
+	_ = g.AddNode("n:1", "node")
+	_ = g.AddNode("n:2", "node")
+	_ = g.AddNode("n:3", "node")
 
-	g.AddEdge("n:1", "n:2", "LINK")
-	g.AddEdge("n:2", "n:3", "LINK")
+	_ = g.AddEdge("n:1", "n:2", "LINK")
+	_ = g.AddEdge("n:2", "n:3", "LINK")
 	
 	// This would create a cycle - should fail with error mode
 	err := g.AddEdge("n:3", "n:1", "LINK")
@@ -729,7 +745,7 @@ func TestCycleDetection_Error(t *testing.T) {
 func TestCycleDetection_SelfLoop(t *testing.T) {
 	g := NewIndexedGraphWithCycleDetection("error")
 
-	g.AddNode("n:1", "node")
+	_ = g.AddNode("n:1", "node")
 
 	// Self-loop is a cycle
 	err := g.AddEdge("n:1", "n:1", "SELF")
@@ -741,10 +757,10 @@ func TestCycleDetection_SelfLoop(t *testing.T) {
 func TestCycleDetection_NoCycle(t *testing.T) {
 	g := NewIndexedGraphWithCycleDetection("error")
 
-	g.AddNode("n:1", "node")
-	g.AddNode("n:2", "node")
-	g.AddNode("n:3", "node")
-	g.AddNode("n:4", "node")
+	_ = g.AddNode("n:1", "node")
+	_ = g.AddNode("n:2", "node")
+	_ = g.AddNode("n:3", "node")
+	_ = g.AddNode("n:4", "node")
 
 	// Create a DAG (no cycles)
 	err := g.AddEdge("n:1", "n:2", "LINK")
@@ -778,7 +794,7 @@ func TestCycleDetection_LongPath(t *testing.T) {
 
 	// Create a long chain: 1 -> 2 -> 3 -> 4 -> 5
 	for i := 1; i <= 5; i++ {
-		g.AddNode(fmt.Sprintf("n:%d", i), "node")
+		_ = g.AddNode(fmt.Sprintf("n:%d", i), "node")
 	}
 	
 	for i := 1; i < 5; i++ {
@@ -798,8 +814,8 @@ func TestCycleDetection_LongPath(t *testing.T) {
 func TestCycleDetection_ParallelEdges(t *testing.T) {
 	g := NewIndexedGraphWithCycleDetection("error")
 
-	g.AddNode("n:1", "node")
-	g.AddNode("n:2", "node")
+	_ = g.AddNode("n:1", "node")
+	_ = g.AddNode("n:2", "node")
 
 	// Add edge 1 -> 2
 	err := g.AddEdge("n:1", "n:2", "LINK")

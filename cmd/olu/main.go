@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/ha1tch/olu/pkg/cache"
 	"github.com/ha1tch/olu/pkg/config"
 	"github.com/ha1tch/olu/pkg/graph"
@@ -16,7 +17,6 @@ import (
 	"github.com/ha1tch/olu/pkg/storage"
 	"github.com/ha1tch/olu/pkg/validation"
 	"github.com/ha1tch/olu/pkg/version"
-	"github.com/rs/zerolog"
 )
 
 func main() {
@@ -38,14 +38,14 @@ func main() {
 		Timestamp().
 		Logger().
 		Output(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339})
-
+	
 	// Load configuration
 	cfg := config.Default()
 	config.LoadFromEnv(cfg)
-
+	
 	// Print banner
 	printBanner(cfg, logger)
-
+	
 	// Create directories
 	if err := os.MkdirAll(cfg.BaseDir, 0755); err != nil {
 		logger.Fatal().Err(err).Msg("Failed to create base directory")
@@ -53,10 +53,10 @@ func main() {
 	if err := os.MkdirAll(cfg.SchemaDir, 0755); err != nil {
 		logger.Fatal().Err(err).Msg("Failed to create schema directory")
 	}
-
+	
 	// Initialize storage
 	var storeConfig map[string]interface{}
-
+	
 	if cfg.StorageType == "sqlite" {
 		storeConfig = map[string]interface{}{
 			"db_path":           cfg.DBPath,
@@ -68,13 +68,13 @@ func main() {
 			"schema":   cfg.Schema,
 		}
 	}
-
+	
 	store, err := storage.NewStore(cfg.StorageType, storeConfig)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("Failed to initialize storage")
 	}
 	defer store.Close()
-
+	
 	// Log store info
 	if infoProvider, ok := store.(storage.InfoProvider); ok {
 		info := infoProvider.Info()
@@ -86,7 +86,7 @@ func main() {
 			Bool("supports_transaction", info.SupportsTransaction).
 			Msg("Storage initialized")
 	}
-
+	
 	// Initialize cache
 	var cacheInstance cache.Cache
 	if cfg.CacheType == "redis" {
@@ -107,13 +107,13 @@ func main() {
 		logger.Info().Msg("Using in-memory cache")
 	}
 	defer cacheInstance.Close()
-
+	
 	// Initialize graph
 	var graphInstance graph.Graph
 	var persister *graph.AdaptivePersister
 	if cfg.GraphEnabled && cfg.GraphMode == "indexed" {
 		graphInstance = graph.NewIndexedGraphWithCycleDetection(cfg.GraphCycleDetection)
-
+		
 		// Load graph from file if exists
 		graphFile := filepath.Join(cfg.BaseDir, cfg.GraphDataFile)
 		if err := graphInstance.Load(graphFile); err != nil {
@@ -121,46 +121,46 @@ func main() {
 		} else {
 			logger.Info().Msg("Loaded existing graph")
 		}
-
+		
 		// Load entities into graph
 		if err := loadEntitiesIntoGraph(cfg, store, graphInstance, logger); err != nil {
 			logger.Error().Err(err).Msg("Failed to load entities into graph")
 		}
-
+		
 		// Create and start adaptive persister
 		persister = graph.NewAdaptivePersister(graphInstance, graphFile, logger)
 		persister.Start()
-
+		
 		logger.Info().Msg("Graph initialized")
 	} else {
 		logger.Info().Msg("Graph disabled")
 	}
-
+	
 	// Initialize validator
 	validator := validation.NewJSONSchemaValidator(cfg.SchemaDir)
 	if err := validator.LoadAllSchemas(); err != nil {
 		logger.Warn().Err(err).Msg("Failed to load schemas")
 	}
-
+	
 	// Create server
 	srv := server.New(cfg, store, cacheInstance, graphInstance, persister, validator, logger)
-
+	
 	// Setup graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
+	
 	go func() {
 		<-sigChan
 		logger.Info().Msg("Shutting down gracefully...")
-
+		
 		// Stop persister (triggers final save)
 		if persister != nil {
 			persister.Stop()
 		}
-
+		
 		os.Exit(0)
 	}()
-
+	
 	// Start server
 	logger.Info().Msg("Server ready to accept requests")
 	if err := srv.Start(); err != nil {
@@ -172,7 +172,7 @@ func printBanner(cfg *config.Config, logger zerolog.Logger) {
 	// Light blue color code
 	lightBlue := "\033[1;36m"
 	reset := "\033[0m"
-
+	
 	// Print ASCII art in light blue
 	fmt.Print(lightBlue)
 	fmt.Println("//////////////////////////////////////////////")
@@ -195,10 +195,10 @@ func printBanner(cfg *config.Config, logger zerolog.Logger) {
 	fmt.Println("//..........................................//")
 	fmt.Println("//////////////////////////////////////////////")
 	fmt.Print(reset)
-
+	
 	fmt.Println()
-	fmt.Println("////////////////// olu " + version.Version + " /////////////////")
-	fmt.Println("----------------------------------------------")
+	fmt.Println("//////////////////////////// olu " + version.Version + " /////////////////////////////")
+	fmt.Println("----------------------------------------------------------------------")
 	fmt.Println("Server Configuration:")
 	fmt.Printf("  Host: %s\n", cfg.Host)
 	fmt.Printf("  Port: %d\n", cfg.Port)
@@ -238,7 +238,7 @@ func loadEntitiesIntoGraph(
 ) error {
 	ctx := context.Background()
 	schemaPath := filepath.Join(cfg.BaseDir, cfg.Schema)
-
+	
 	entries, err := os.ReadDir(schemaPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -246,20 +246,20 @@ func loadEntitiesIntoGraph(
 		}
 		return err
 	}
-
+	
 	count := 0
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-
+		
 		entityName := entry.Name()
 		entities, err := store.List(ctx, entityName)
 		if err != nil {
 			logger.Warn().Err(err).Str("entity", entityName).Msg("Failed to list entities")
 			continue
 		}
-
+		
 		for _, data := range entities {
 			id, ok := data["id"].(float64)
 			if !ok {
@@ -269,7 +269,7 @@ func loadEntitiesIntoGraph(
 					continue
 				}
 			}
-
+			
 			if err := g.UpdateFromEntity(entityName, int(id), data); err != nil {
 				logger.Warn().Err(err).
 					Str("entity", entityName).
@@ -280,7 +280,7 @@ func loadEntitiesIntoGraph(
 			}
 		}
 	}
-
+	
 	logger.Info().Int("count", count).Msg("Loaded entities into graph")
 	return nil
 }
