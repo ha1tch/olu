@@ -240,44 +240,31 @@ func (e *Executor) evalCondition(rec map[string]interface{}, expr ast.Expression
 	case *ast.IsNullExpression:
 		val := e.evalExpr(rec, ex.Expr)
 		isNull := val == nil
-		if ex.Not {
-			return !isNull
-		}
-		return isNull
+		return isNull != ex.Not
 
 	case *ast.BetweenExpression:
 		val := e.evalExpr(rec, ex.Expr)
 		low := e.evalExpr(rec, ex.Low)
 		high := e.evalExpr(rec, ex.High)
 		inRange := compareValues(val, low) >= 0 && compareValues(val, high) <= 0
-		if ex.Not {
-			return !inRange
-		}
-		return inRange
+		return inRange != ex.Not
 
 	case *ast.InExpression:
 		val := e.evalExpr(rec, ex.Expr)
+		found := false
 		for _, item := range ex.Values {
 			if compareValues(val, e.evalExpr(rec, item)) == 0 {
-				if ex.Not {
-					return false
-				}
-				return true
+				found = true
+				break
 			}
 		}
-		if ex.Not {
-			return true
-		}
-		return false
+		return found != ex.Not
 
 	case *ast.LikeExpression:
 		val := fmt.Sprintf("%v", e.evalExpr(rec, ex.Expr))
 		pattern := fmt.Sprintf("%v", e.evalExpr(rec, ex.Pattern))
 		matches := matchLike(val, pattern)
-		if ex.Not {
-			return !matches
-		}
-		return matches
+		return matches != ex.Not
 	}
 
 	return true // Default to true for unsupported expressions
