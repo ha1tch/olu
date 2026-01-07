@@ -198,7 +198,7 @@ func (s *SQLiteStore) Create(ctx context.Context, entity string, data map[string
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	
 	// Get next ID
 	var nextID int
@@ -346,7 +346,7 @@ func (s *SQLiteStore) Update(ctx context.Context, entity string, id int, data ma
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	
 	// Create a copy to avoid mutating input
 	dataCopy := make(map[string]interface{}, len(data)+1)
@@ -401,7 +401,7 @@ func (s *SQLiteStore) Patch(ctx context.Context, entity string, id int, updates 
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	
 	// Get existing data directly (we already hold the lock)
 	var jsonData string
@@ -482,7 +482,7 @@ func (s *SQLiteStore) Delete(ctx context.Context, entity string, id int) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	
 	// Delete entity
 	result, err := tx.ExecContext(ctx, `
@@ -557,7 +557,7 @@ func (s *SQLiteStore) Save(ctx context.Context, entity string, id int, data map[
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	
 	// Update sequence if needed
 	_, err = tx.ExecContext(ctx, `
@@ -857,7 +857,7 @@ func (s *SQLiteStore) RebuildGraph(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	
 	// Clear graph_edges
 	if _, err := tx.ExecContext(ctx, "DELETE FROM graph_edges"); err != nil {

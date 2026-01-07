@@ -112,13 +112,13 @@ func WithTransaction(ctx context.Context, store Store, fn func(Transaction) erro
 		
 		defer func() {
 			if r := recover(); r != nil {
-				tx.Rollback()
+				_ = tx.Rollback()
 				panic(r)
 			}
 		}()
 		
 		if err := fn(tx); err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			return err
 		}
 		

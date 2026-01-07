@@ -1,0 +1,35 @@
+{
+  "type": "object",
+  "required": ["name", "email"],
+  "properties": {
+    "id": {
+      "type": "integer",
+      "description": "Auto-generated ID"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "email": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+    },
+    "age": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 150
+    },
+    "active": {
+      "type": "boolean"
+    },
+    "role": {
+      "type": "string",
+      "enum": ["admin", "user", "guest"]
+    },
+    "manager": {
+      "type": "object",
+      "description": "Reference to another user"
+    }
+  }
+}

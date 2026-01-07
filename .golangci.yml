@@ -1,0 +1,42 @@
+# golangci-lint configuration
+# See: https://golangci-lint.run/usage/configuration/
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+linters-settings:
+  errcheck:
+    # Don't check error returns in test files - test setup code
+    # often ignores errors intentionally
+    exclude-functions:
+      - (io.Closer).Close
+      - (net/http.ResponseWriter).Write
+      - fmt.Fprintf
+      - fmt.Printf
+      - fmt.Print
+      - fmt.Println
+    check-type-assertions: false
+    check-blank: false
+
+issues:
+  # Exclude errcheck in test files
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
+    # Exclude some gosimple/govet issues that are noisy
+    - path: _test\.go
+      linters:
+        - gosimple
+        - govet
+      text: "should use"

@@ -220,7 +220,7 @@ func writeAuthError(w http.ResponseWriter, authType string) {
 	}
 
 	w.WriteHeader(http.StatusUnauthorized)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"error":   "Unauthorized",
 		"message": "Authentication required",
 	})

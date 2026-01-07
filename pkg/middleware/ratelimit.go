@@ -141,7 +141,7 @@ func RateLimitMiddleware(cfg *config.Config, limiter *RateLimiter) func(http.Han
 				w.Header().Set("Retry-After", strconv.FormatInt(int64(time.Until(resetTime).Seconds())+1, 10))
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusTooManyRequests)
-				json.NewEncoder(w).Encode(map[string]interface{}{
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
 					"error":       "Too Many Requests",
 					"message":     "Rate limit exceeded",
 					"retry_after": int(time.Until(resetTime).Seconds()) + 1,
