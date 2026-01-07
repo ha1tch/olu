@@ -23,9 +23,10 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
-          # Linux
+          # Linux - all platforms supported
           - goos: linux
             goarch: amd64
             suffix: ''
@@ -40,7 +41,7 @@ jobs:
             goarch: '386'
             suffix: ''
           
-          # macOS
+          # macOS - all platforms supported
           - goos: darwin
             goarch: amd64
             suffix: ''
@@ -48,18 +49,15 @@ jobs:
             goarch: arm64
             suffix: ''
           
-          # Windows
+          # Windows - amd64 and arm64 only (386 has SQLite issues)
           - goos: windows
             goarch: amd64
             suffix: '.exe'
           - goos: windows
             goarch: arm64
             suffix: '.exe'
-          - goos: windows
-            goarch: '386'
-            suffix: '.exe'
           
-          # FreeBSD
+          # FreeBSD - all platforms supported
           - goos: freebsd
             goarch: amd64
             suffix: ''
@@ -70,26 +68,17 @@ jobs:
             goarch: '386'
             suffix: ''
           
-          # OpenBSD
+          # OpenBSD - amd64 and arm64 only (386 has SQLite issues)
           - goos: openbsd
             goarch: amd64
             suffix: ''
           - goos: openbsd
             goarch: arm64
-            suffix: ''
-          - goos: openbsd
-            goarch: '386'
             suffix: ''
           
-          # NetBSD
+          # NetBSD - amd64 only (386 and arm64 have SQLite issues)
           - goos: netbsd
             goarch: amd64
-            suffix: ''
-          - goos: netbsd
-            goarch: arm64
-            suffix: ''
-          - goos: netbsd
-            goarch: '386'
             suffix: ''
 
     steps:
