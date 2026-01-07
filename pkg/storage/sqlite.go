@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
 	_ "modernc.org/sqlite" // Pure Go SQLite driver
@@ -20,11 +21,12 @@ type SQLiteStore struct {
 
 // SQLiteConfig holds SQLite-specific configuration
 type SQLiteConfig struct {
-	DBPath           string
-	EnableWAL        bool // Write-Ahead Logging for better concurrency
+	DBPath            string
+	EnableWAL         bool // Write-Ahead Logging for better concurrency
 	EnableForeignKeys bool
-	CacheSize        int  // Page cache size in KB
-	BusyTimeout      int  // Milliseconds to wait on locked database
+	CacheSize         int  // Page cache size in KB
+	BusyTimeout       int  // Milliseconds to wait on locked database
+	FullTextEnabled   bool // Enable FTS5 full-text search indexing
 }
 
 // NewSQLiteStore creates a new SQLite-based storage
@@ -123,6 +125,14 @@ func (s *SQLiteStore) initialize(ctx context.Context) error {
 		CREATE TABLE IF NOT EXISTS schema_version (
 			version INTEGER PRIMARY KEY,
 			applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);
+		
+		-- Full-text search virtual table (FTS5)
+		-- Stores searchable text content extracted from entity JSON
+		CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
+			entity_type UNINDEXED,
+			entity_id UNINDEXED,
+			content
 		);
 	`
 	
@@ -227,6 +237,11 @@ func (s *SQLiteStore) Create(ctx context.Context, entity string, data map[string
 	// Manually sync graph edges
 	if err := s.syncGraphEdges(ctx, tx, entity, nextID, dataCopy); err != nil {
 		return 0, fmt.Errorf("failed to sync graph: %w", err)
+	}
+	
+	// Index for full-text search
+	if err := s.indexForFTS(ctx, tx, entity, nextID, dataCopy); err != nil {
+		return 0, fmt.Errorf("failed to index for FTS: %w", err)
 	}
 	
 	if err := tx.Commit(); err != nil {
@@ -369,6 +384,11 @@ func (s *SQLiteStore) Update(ctx context.Context, entity string, id int, data ma
 		return fmt.Errorf("failed to sync graph: %w", err)
 	}
 	
+	// Update FTS index
+	if err := s.indexForFTS(ctx, tx, entity, id, dataCopy); err != nil {
+		return fmt.Errorf("failed to update FTS index: %w", err)
+	}
+	
 	return tx.Commit()
 }
 
@@ -445,6 +465,11 @@ func (s *SQLiteStore) Patch(ctx context.Context, entity string, id int, updates 
 		return fmt.Errorf("failed to sync graph: %w", err)
 	}
 	
+	// Update FTS index
+	if err := s.indexForFTS(ctx, tx, entity, id, existing); err != nil {
+		return fmt.Errorf("failed to update FTS index: %w", err)
+	}
+	
 	return tx.Commit()
 }
 
@@ -484,6 +509,14 @@ func (s *SQLiteStore) Delete(ctx context.Context, entity string, id int) error {
 	`, entity, id, entity, id)
 	if err != nil {
 		return fmt.Errorf("failed to delete graph edges: %w", err)
+	}
+	
+	// Remove from FTS index
+	_, err = tx.ExecContext(ctx, `
+		DELETE FROM entities_fts WHERE entity_type = ? AND entity_id = ?
+	`, entity, fmt.Sprintf("%d", id))
+	if err != nil {
+		return fmt.Errorf("failed to delete from FTS index: %w", err)
 	}
 	
 	return tx.Commit()
@@ -878,3 +911,145 @@ func (s *SQLiteStore) RebuildGraph(ctx context.Context) error {
 	
 	return tx.Commit()
 }
+
+
+// indexForFTS extracts text content from entity and indexes it for full-text search
+func (s *SQLiteStore) indexForFTS(ctx context.Context, tx *sql.Tx, entity string, id int, data map[string]interface{}) error {
+	// Skip if FTS is not enabled
+	if !s.config.FullTextEnabled {
+		return nil
+	}
+
+	// Convert id to string for FTS storage
+	idStr := fmt.Sprintf("%d", id)
+
+	// First, delete any existing FTS entry for this entity
+	_, err := tx.ExecContext(ctx, `
+		DELETE FROM entities_fts WHERE entity_type = ? AND entity_id = ?
+	`, entity, idStr)
+	if err != nil {
+		return err
+	}
+	
+	// Extract searchable text content from the entity
+	content := extractTextContent(data)
+	if content == "" {
+		return nil // Nothing to index
+	}
+	
+	// Insert into FTS index
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO entities_fts (entity_type, entity_id, content)
+		VALUES (?, ?, ?)
+	`, entity, idStr, content)
+	
+	return err
+}
+
+// extractTextContent recursively extracts all string values from a map
+func extractTextContent(data map[string]interface{}) string {
+	var parts []string
+	
+	for key, value := range data {
+		// Skip internal fields
+		if key == "id" || key == "created_at" || key == "updated_at" {
+			continue
+		}
+		
+		switch v := value.(type) {
+		case string:
+			if v != "" {
+				parts = append(parts, v)
+			}
+		case map[string]interface{}:
+			// Check if it is a REF (skip references)
+			if _, isRef := v["type"]; !isRef || v["type"] != "REF" {
+				if nested := extractTextContent(v); nested != "" {
+					parts = append(parts, nested)
+				}
+			}
+		case []interface{}:
+			for _, item := range v {
+				if str, ok := item.(string); ok && str != "" {
+					parts = append(parts, str)
+				} else if m, ok := item.(map[string]interface{}); ok {
+					if nested := extractTextContent(m); nested != "" {
+						parts = append(parts, nested)
+					}
+				}
+			}
+		}
+	}
+	
+	return strings.Join(parts, " ")
+}
+
+// FullTextSearch performs a full-text search across entities
+func (s *SQLiteStore) FullTextSearch(ctx context.Context, query string, entity string) ([]map[string]interface{}, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	
+	if query == "" {
+		return []map[string]interface{}{}, nil
+	}
+	
+	// Add prefix matching with * for partial word matches
+	ftsQuery := query + "*"
+	
+	var rows *sql.Rows
+	var err error
+	
+	if entity != "" {
+		// Search within specific entity type
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT e.entity_type, e.id, e.data
+			FROM entities_fts
+			JOIN entities e ON entities_fts.entity_type = e.entity_type AND CAST(entities_fts.entity_id AS INTEGER) = e.id
+			WHERE entities_fts.entity_type = ? AND entities_fts MATCH ?
+			ORDER BY rank
+			LIMIT 100
+		`, entity, ftsQuery)
+	} else {
+		// Search across all entities
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT e.entity_type, e.id, e.data
+			FROM entities_fts
+			JOIN entities e ON entities_fts.entity_type = e.entity_type AND CAST(entities_fts.entity_id AS INTEGER) = e.id
+			WHERE entities_fts MATCH ?
+			ORDER BY rank
+			LIMIT 100
+		`, ftsQuery)
+	}
+	
+	if err != nil {
+		return nil, fmt.Errorf("full-text search failed: %w", err)
+	}
+	defer rows.Close()
+	
+	var results []map[string]interface{}
+	for rows.Next() {
+		var entityType string
+		var id int
+		var jsonData string
+		
+		if err := rows.Scan(&entityType, &id, &jsonData); err != nil {
+			return nil, err
+		}
+		
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonData), &data); err != nil {
+			continue
+		}
+		
+		// Add metadata
+		data["_entity"] = entityType
+		results = append(results, data)
+	}
+	
+	if results == nil {
+		results = []map[string]interface{}{}
+	}
+	
+	return results, rows.Err()
+}
+

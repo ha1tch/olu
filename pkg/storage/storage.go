@@ -29,6 +29,10 @@ type Store interface {
 	// Query operations
 	List(ctx context.Context, entity string) ([]map[string]interface{}, error)
 	Exists(ctx context.Context, entity string, id int) bool
+	Search(ctx context.Context, entity string, field string, query string, matchType string) ([]map[string]interface{}, error)
+	
+	// Full-text search (optional - may return empty if not supported)
+	FullTextSearch(ctx context.Context, query string, entity string) ([]map[string]interface{}, error)
 	
 	// Lifecycle
 	Close() error

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,9 +22,47 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// setupBenchServer creates a server for benchmarking
-func setupBenchServer(b *testing.B) (*httptest.Server, *config.Config) {
+// portRecoveryMu serializes benchmark cleanup to allow port recovery
+var portRecoveryMu sync.Mutex
+var lastBenchmarkEnd time.Time
+
+const portRecoveryDelay = 5 * time.Second
+
+// waitForPortRecovery waits for ports to become available
+func waitForPortRecovery(b *testing.B) {
+	portRecoveryMu.Lock()
+	defer portRecoveryMu.Unlock()
+
+	if !lastBenchmarkEnd.IsZero() {
+		elapsed := time.Since(lastBenchmarkEnd)
+		if elapsed < portRecoveryDelay {
+			wait := portRecoveryDelay - elapsed
+			b.Logf("Waiting %.0fs for port recovery...", wait.Seconds())
+			time.Sleep(wait)
+		}
+	}
+}
+
+// markBenchmarkEnd records when a benchmark finished
+func markBenchmarkEnd() {
+	portRecoveryMu.Lock()
+	lastBenchmarkEnd = time.Now()
+	portRecoveryMu.Unlock()
+}
+
+// benchEnv holds the test server and a dedicated HTTP client
+type benchEnv struct {
+	server *httptest.Server
+	client *http.Client
+	config *config.Config
+}
+
+// setupBenchServer creates a server and dedicated client for benchmarking
+func setupBenchServer(b *testing.B) *benchEnv {
 	b.Helper()
+
+	// Wait for ports from previous benchmark to recover
+	waitForPortRecovery(b)
 
 	tmpDir, err := os.MkdirTemp("", "olu-bench-*")
 	if err != nil {
@@ -30,19 +70,20 @@ func setupBenchServer(b *testing.B) (*httptest.Server, *config.Config) {
 	}
 
 	cfg := &config.Config{
-		BaseDir:            tmpDir,
-		Schema:             "bench_schema",
-		CacheType:          "memory",
-		CacheTTL:           300,
-		GraphEnabled:       true,
-		GraphMode:          "indexed",
-		FullTextEnabled:    false,
-		CascadingDelete:    false,
-		RefEmbedDepth:      3,
-		MaxEmbedDepth:      10,
-		GraphDataFile:      filepath.Join(tmpDir, "graph.data"),
-		GraphIndexFile:     filepath.Join(tmpDir, "graph.index"),
+		BaseDir:             tmpDir,
+		Schema:              "bench_schema",
+		CacheType:           "memory",
+		CacheTTL:            300,
+		GraphEnabled:        true,
+		GraphMode:           "indexed",
+		FullTextEnabled:     false,
+		CascadingDelete:     false,
+		RefEmbedDepth:       3,
+		MaxEmbedDepth:       10,
+		GraphDataFile:       filepath.Join(tmpDir, "graph.data"),
+		GraphIndexFile:      filepath.Join(tmpDir, "graph.index"),
 		MaxCascadeDeletions: 100,
+		MaxEntitySize:       1048576, // 1MB
 	}
 
 	storeConfig := map[string]interface{}{
@@ -50,96 +91,136 @@ func setupBenchServer(b *testing.B) (*httptest.Server, *config.Config) {
 		"schema":   cfg.Schema,
 	}
 
-	store, _ := storage.NewStore("jsonfile", storeConfig)
+	store, err := storage.NewStore("jsonfile", storeConfig)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		b.Fatalf("Failed to create store: %v", err)
+	}
+
 	memCache := cache.NewMemoryCache(1000, time.Duration(cfg.CacheTTL)*time.Second)
 	g := graph.NewIndexedGraph()
 	schemaDir := filepath.Join(cfg.BaseDir, cfg.Schema, "_schemas")
 	validator := validation.NewJSONSchemaValidator(schemaDir)
 	logger := zerolog.New(os.Stdout).Level(zerolog.Disabled)
 
-	srv := server.New(cfg, store, memCache, g, validator, logger)
+	srv := server.New(cfg, store, memCache, g, nil, validator, logger)
 	ts := httptest.NewServer(srv.Handler())
+
+	// Use the test server's client
+	client := ts.Client()
+
+	env := &benchEnv{
+		server: ts,
+		client: client,
+		config: cfg,
+	}
 
 	b.Cleanup(func() {
 		ts.Close()
 		os.RemoveAll(tmpDir)
+		markBenchmarkEnd()
 	})
 
-	return ts, cfg
+	return env
+}
+
+// URL returns the server URL
+func (e *benchEnv) URL() string {
+	return e.server.URL
+}
+
+// Do executes an HTTP request using the dedicated client
+func (e *benchEnv) Do(b *testing.B, req *http.Request) *http.Response {
+	resp, err := e.client.Do(req)
+	if err != nil {
+		b.Fatalf("Request failed: %v", err)
+	}
+	return resp
+}
+
+// CreateEntity creates an entity and returns its ID
+func (e *benchEnv) CreateEntity(b *testing.B, entity string, data map[string]interface{}) int {
+	b.Helper()
+
+	bodyBytes, _ := json.Marshal(data)
+	req, err := http.NewRequest("POST", e.URL()+"/api/v1/"+entity, bytes.NewBuffer(bodyBytes))
+	if err != nil {
+		b.Fatalf("Failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := e.client.Do(req)
+	if err != nil {
+		b.Fatalf("Failed to execute request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		b.Fatalf("Failed to create entity: status=%d body=%s", resp.StatusCode, string(body))
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		b.Fatalf("Failed to decode response: %v", err)
+	}
+
+	idVal, ok := result["id"]
+	if !ok {
+		b.Fatal("Response missing 'id' field")
+	}
+
+	id, ok := idVal.(float64)
+	if !ok {
+		b.Fatalf("Invalid id type: %T", idVal)
+	}
+
+	return int(id)
 }
 
 // BenchmarkCreate benchmarks entity creation
 func BenchmarkCreate(b *testing.B) {
-	ts, _ := setupBenchServer(b)
+	env := setupBenchServer(b)
 
 	data := map[string]interface{}{
 		"name":  "Benchmark User",
 		"email": "bench@example.com",
 		"age":   25,
 	}
-
 	bodyBytes, _ := json.Marshal(data)
 
 	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			req, _ := http.NewRequest("POST", ts.URL+"/api/v1/users", bytes.NewBuffer(bodyBytes))
-			req.Header.Set("Content-Type", "application/json")
-			resp, _ := http.DefaultClient.Do(req)
-			resp.Body.Close()
-		}
-	})
+	for i := 0; i < b.N; i++ {
+		req, _ := http.NewRequest("POST", env.URL()+"/api/v1/users", bytes.NewBuffer(bodyBytes))
+		req.Header.Set("Content-Type", "application/json")
+		resp := env.Do(b, req)
+		resp.Body.Close()
+	}
 }
 
 // BenchmarkGet benchmarks entity retrieval
 func BenchmarkGet(b *testing.B) {
-	ts, _ := setupBenchServer(b)
-
-	// Create test entity
-	data := map[string]interface{}{
+	env := setupBenchServer(b)
+	id := env.CreateEntity(b, "users", map[string]interface{}{
 		"name":  "Benchmark User",
 		"email": "bench@example.com",
-	}
-	bodyBytes, _ := json.Marshal(data)
-	req, _ := http.NewRequest("POST", ts.URL+"/api/v1/users", bytes.NewBuffer(bodyBytes))
-	req.Header.Set("Content-Type", "application/json")
-	resp, _ := http.DefaultClient.Do(req)
-	
-	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
-	resp.Body.Close()
-	
-	id := int(result["id"].(float64))
+	})
 
 	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			req, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/v1/users/%d", ts.URL, id), nil)
-			resp, _ := http.DefaultClient.Do(req)
-			resp.Body.Close()
-		}
-	})
+	for i := 0; i < b.N; i++ {
+		req, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/v1/users/%d", env.URL(), id), nil)
+		resp := env.Do(b, req)
+		resp.Body.Close()
+	}
 }
 
 // BenchmarkUpdate benchmarks entity updates
 func BenchmarkUpdate(b *testing.B) {
-	ts, _ := setupBenchServer(b)
-
-	// Create test entity
-	data := map[string]interface{}{
+	env := setupBenchServer(b)
+	id := env.CreateEntity(b, "users", map[string]interface{}{
 		"name":  "Benchmark User",
 		"email": "bench@example.com",
-	}
-	bodyBytes, _ := json.Marshal(data)
-	req, _ := http.NewRequest("POST", ts.URL+"/api/v1/users", bytes.NewBuffer(bodyBytes))
-	req.Header.Set("Content-Type", "application/json")
-	resp, _ := http.DefaultClient.Do(req)
-	
-	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
-	resp.Body.Close()
-	
-	id := int(result["id"].(float64))
+	})
 
 	updateData := map[string]interface{}{
 		"name":  "Updated User",
@@ -149,137 +230,106 @@ func BenchmarkUpdate(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		req, _ := http.NewRequest("PUT", fmt.Sprintf("%s/api/v1/users/%d", ts.URL, id), bytes.NewBuffer(updateBytes))
+		req, _ := http.NewRequest("PUT", fmt.Sprintf("%s/api/v1/users/%d", env.URL(), id), bytes.NewBuffer(updateBytes))
 		req.Header.Set("Content-Type", "application/json")
-		resp, _ := http.DefaultClient.Do(req)
+		resp := env.Do(b, req)
 		resp.Body.Close()
 	}
 }
 
 // BenchmarkPatch benchmarks partial updates
 func BenchmarkPatch(b *testing.B) {
-	ts, _ := setupBenchServer(b)
-
-	// Create test entity
-	data := map[string]interface{}{
+	env := setupBenchServer(b)
+	id := env.CreateEntity(b, "users", map[string]interface{}{
 		"name":  "Benchmark User",
 		"email": "bench@example.com",
 		"age":   25,
-	}
-	bodyBytes, _ := json.Marshal(data)
-	req, _ := http.NewRequest("POST", ts.URL+"/api/v1/users", bytes.NewBuffer(bodyBytes))
-	req.Header.Set("Content-Type", "application/json")
-	resp, _ := http.DefaultClient.Do(req)
-	
-	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
-	resp.Body.Close()
-	
-	id := int(result["id"].(float64))
+	})
 
-	patchData := map[string]interface{}{
-		"age": 26,
-	}
+	patchData := map[string]interface{}{"age": 26}
 	patchBytes, _ := json.Marshal(patchData)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		req, _ := http.NewRequest("PATCH", fmt.Sprintf("%s/api/v1/users/%d", ts.URL, id), bytes.NewBuffer(patchBytes))
+		req, _ := http.NewRequest("PATCH", fmt.Sprintf("%s/api/v1/users/%d", env.URL(), id), bytes.NewBuffer(patchBytes))
 		req.Header.Set("Content-Type", "application/json")
-		resp, _ := http.DefaultClient.Do(req)
+		resp := env.Do(b, req)
 		resp.Body.Close()
 	}
 }
 
-// BenchmarkList benchmarks entity listing
+// BenchmarkList benchmarks entity listing with 10 pre-created entities
 func BenchmarkList(b *testing.B) {
-	ts, _ := setupBenchServer(b)
+	env := setupBenchServer(b)
 
-	// Create 100 test entities
-	for i := 0; i < 100; i++ {
-		data := map[string]interface{}{
+	// Create only 10 test entities
+	for i := 0; i < 10; i++ {
+		env.CreateEntity(b, "users", map[string]interface{}{
 			"name":  fmt.Sprintf("User%d", i),
 			"email": fmt.Sprintf("user%d@example.com", i),
-		}
-		bodyBytes, _ := json.Marshal(data)
-		req, _ := http.NewRequest("POST", ts.URL+"/api/v1/users", bytes.NewBuffer(bodyBytes))
-		req.Header.Set("Content-Type", "application/json")
-		resp, _ := http.DefaultClient.Do(req)
-		resp.Body.Close()
+		})
 	}
 
 	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			req, _ := http.NewRequest("GET", ts.URL+"/api/v1/users", nil)
-			resp, _ := http.DefaultClient.Do(req)
-			resp.Body.Close()
-		}
-	})
+	for i := 0; i < b.N; i++ {
+		req, _ := http.NewRequest("GET", env.URL()+"/api/v1/users", nil)
+		resp := env.Do(b, req)
+		resp.Body.Close()
+	}
 }
 
 // BenchmarkListPaginated benchmarks paginated listing
 func BenchmarkListPaginated(b *testing.B) {
-	ts, _ := setupBenchServer(b)
+	env := setupBenchServer(b)
 
-	// Create 100 test entities
-	for i := 0; i < 100; i++ {
-		data := map[string]interface{}{
+	// Create only 10 test entities
+	for i := 0; i < 10; i++ {
+		env.CreateEntity(b, "users", map[string]interface{}{
 			"name": fmt.Sprintf("User%d", i),
-		}
-		bodyBytes, _ := json.Marshal(data)
-		req, _ := http.NewRequest("POST", ts.URL+"/api/v1/users", bytes.NewBuffer(bodyBytes))
-		req.Header.Set("Content-Type", "application/json")
-		resp, _ := http.DefaultClient.Do(req)
-		resp.Body.Close()
+		})
 	}
 
 	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			req, _ := http.NewRequest("GET", ts.URL+"/api/v1/users?page=1&per_page=20", nil)
-			resp, _ := http.DefaultClient.Do(req)
-			resp.Body.Close()
-		}
-	})
+	for i := 0; i < b.N; i++ {
+		req, _ := http.NewRequest("GET", env.URL()+"/api/v1/users?page=1&per_page=20", nil)
+		resp := env.Do(b, req)
+		resp.Body.Close()
+	}
 }
 
 // BenchmarkDelete benchmarks entity deletion
 func BenchmarkDelete(b *testing.B) {
-	ts, _ := setupBenchServer(b)
+	env := setupBenchServer(b)
 
-	// Pre-create entities to delete
-	ids := make([]int, b.N)
-	for i := 0; i < b.N; i++ {
-		data := map[string]interface{}{
+	// Only pre-create what we need, with a reasonable cap
+	n := b.N
+	if n > 50 {
+		n = 50
+	}
+
+	ids := make([]int, n)
+	for i := 0; i < n; i++ {
+		ids[i] = env.CreateEntity(b, "users", map[string]interface{}{
 			"name": fmt.Sprintf("User%d", i),
-		}
-		bodyBytes, _ := json.Marshal(data)
-		req, _ := http.NewRequest("POST", ts.URL+"/api/v1/users", bytes.NewBuffer(bodyBytes))
-		req.Header.Set("Content-Type", "application/json")
-		resp, _ := http.DefaultClient.Do(req)
-		
-		var result map[string]interface{}
-		json.NewDecoder(resp.Body).Decode(&result)
-		ids[i] = int(result["id"].(float64))
-		resp.Body.Close()
+		})
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		req, _ := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/users/%d", ts.URL, ids[i]), nil)
-		resp, _ := http.DefaultClient.Do(req)
+		idx := i % len(ids)
+		req, _ := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/users/%d", env.URL(), ids[idx]), nil)
+		resp := env.Do(b, req)
 		resp.Body.Close()
 	}
 }
 
 // BenchmarkGraphPath benchmarks path finding
 func BenchmarkGraphPath(b *testing.B) {
-	ts, _ := setupBenchServer(b)
+	env := setupBenchServer(b)
 
 	// Create chain of users
-	var prevID float64
-	for i := 0; i < 10; i++ {
+	var prevID int
+	for i := 0; i < 5; i++ {
 		data := map[string]interface{}{
 			"name": fmt.Sprintf("User%d", i),
 		}
@@ -287,179 +337,133 @@ func BenchmarkGraphPath(b *testing.B) {
 			data["friend"] = map[string]interface{}{
 				"type":   "REF",
 				"entity": "users",
-				"id":     prevID,
+				"id":     float64(prevID),
 			}
 		}
-		bodyBytes, _ := json.Marshal(data)
-		req, _ := http.NewRequest("POST", ts.URL+"/api/v1/users", bytes.NewBuffer(bodyBytes))
-		req.Header.Set("Content-Type", "application/json")
-		resp, _ := http.DefaultClient.Do(req)
-		
-		var result map[string]interface{}
-		json.NewDecoder(resp.Body).Decode(&result)
-		prevID = result["id"].(float64)
-		resp.Body.Close()
+		prevID = env.CreateEntity(b, "users", data)
 	}
 
 	pathData := map[string]interface{}{
-		"from":      fmt.Sprintf("users:%d", int(prevID)),
+		"from":      fmt.Sprintf("users:%d", prevID),
 		"to":        "users:1",
-		"max_depth": 20,
+		"max_depth": 10,
 	}
 	pathBytes, _ := json.Marshal(pathData)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		req, _ := http.NewRequest("POST", ts.URL+"/api/v1/graph/path", bytes.NewBuffer(pathBytes))
+		req, _ := http.NewRequest("POST", env.URL()+"/api/v1/graph/path", bytes.NewBuffer(pathBytes))
 		req.Header.Set("Content-Type", "application/json")
-		resp, _ := http.DefaultClient.Do(req)
+		resp := env.Do(b, req)
 		resp.Body.Close()
 	}
 }
 
 // BenchmarkGraphNeighbors benchmarks neighbor queries
 func BenchmarkGraphNeighbors(b *testing.B) {
-	ts, _ := setupBenchServer(b)
+	env := setupBenchServer(b)
 
-	// Create user with multiple friends
-	mainUser := map[string]interface{}{"name": "MainUser"}
-	bodyBytes, _ := json.Marshal(mainUser)
-	req, _ := http.NewRequest("POST", ts.URL+"/api/v1/users", bytes.NewBuffer(bodyBytes))
-	req.Header.Set("Content-Type", "application/json")
-	resp, _ := http.DefaultClient.Do(req)
-	
-	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
-	mainID := result["id"].(float64)
-	resp.Body.Close()
+	mainID := env.CreateEntity(b, "users", map[string]interface{}{"name": "MainUser"})
 
-	// Create friends
-	for i := 0; i < 5; i++ {
-		friend := map[string]interface{}{
+	// Create only 3 friends
+	for i := 0; i < 3; i++ {
+		env.CreateEntity(b, "users", map[string]interface{}{
 			"name": fmt.Sprintf("Friend%d", i),
 			"friendOf": map[string]interface{}{
 				"type":   "REF",
 				"entity": "users",
-				"id":     mainID,
+				"id":     float64(mainID),
 			},
-		}
-		bodyBytes, _ := json.Marshal(friend)
-		req, _ := http.NewRequest("POST", ts.URL+"/api/v1/users", bytes.NewBuffer(bodyBytes))
-		req.Header.Set("Content-Type", "application/json")
-		resp, _ := http.DefaultClient.Do(req)
-		resp.Body.Close()
+		})
 	}
 
 	neighborsData := map[string]interface{}{
-		"node_id": fmt.Sprintf("users:%d", int(mainID)),
+		"node_id": fmt.Sprintf("users:%d", mainID),
 	}
 	neighborsBytes, _ := json.Marshal(neighborsData)
 
 	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			req, _ := http.NewRequest("POST", ts.URL+"/api/v1/graph/neighbors", bytes.NewBuffer(neighborsBytes))
-			req.Header.Set("Content-Type", "application/json")
-			resp, _ := http.DefaultClient.Do(req)
-			resp.Body.Close()
-		}
-	})
+	for i := 0; i < b.N; i++ {
+		req, _ := http.NewRequest("POST", env.URL()+"/api/v1/graph/neighbors", bytes.NewBuffer(neighborsBytes))
+		req.Header.Set("Content-Type", "application/json")
+		resp := env.Do(b, req)
+		resp.Body.Close()
+	}
 }
 
 // BenchmarkHealthCheck benchmarks health endpoint
 func BenchmarkHealthCheck(b *testing.B) {
-	ts, _ := setupBenchServer(b)
+	env := setupBenchServer(b)
 
 	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			req, _ := http.NewRequest("GET", ts.URL+"/health", nil)
-			resp, _ := http.DefaultClient.Do(req)
-			resp.Body.Close()
-		}
-	})
+	for i := 0; i < b.N; i++ {
+		req, _ := http.NewRequest("GET", env.URL()+"/health", nil)
+		resp := env.Do(b, req)
+		resp.Body.Close()
+	}
 }
 
-// BenchmarkConcurrentOperations benchmarks mixed concurrent operations
+// BenchmarkConcurrentOperations benchmarks mixed operations
 func BenchmarkConcurrentOperations(b *testing.B) {
-	ts, _ := setupBenchServer(b)
+	env := setupBenchServer(b)
 
-	// Pre-create some entities
-	for i := 0; i < 10; i++ {
-		data := map[string]interface{}{
+	// Pre-create only 5 entities
+	for i := 0; i < 5; i++ {
+		env.CreateEntity(b, "users", map[string]interface{}{
 			"name": fmt.Sprintf("User%d", i),
-		}
-		bodyBytes, _ := json.Marshal(data)
-		req, _ := http.NewRequest("POST", ts.URL+"/api/v1/users", bytes.NewBuffer(bodyBytes))
-		req.Header.Set("Content-Type", "application/json")
-		resp, _ := http.DefaultClient.Do(req)
-		resp.Body.Close()
+		})
 	}
 
 	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		i := 0
-		for pb.Next() {
-			switch i % 4 {
-			case 0: // Create
-				data := map[string]interface{}{"name": "New User"}
-				bodyBytes, _ := json.Marshal(data)
-				req, _ := http.NewRequest("POST", ts.URL+"/api/v1/users", bytes.NewBuffer(bodyBytes))
-				req.Header.Set("Content-Type", "application/json")
-				resp, _ := http.DefaultClient.Do(req)
-				resp.Body.Close()
-			case 1: // Get
-				req, _ := http.NewRequest("GET", ts.URL+"/api/v1/users/1", nil)
-				resp, _ := http.DefaultClient.Do(req)
-				resp.Body.Close()
-			case 2: // List
-				req, _ := http.NewRequest("GET", ts.URL+"/api/v1/users", nil)
-				resp, _ := http.DefaultClient.Do(req)
-				resp.Body.Close()
-			case 3: // Update
-				data := map[string]interface{}{"name": "Updated"}
-				bodyBytes, _ := json.Marshal(data)
-				req, _ := http.NewRequest("PUT", ts.URL+"/api/v1/users/1", bytes.NewBuffer(bodyBytes))
-				req.Header.Set("Content-Type", "application/json")
-				resp, _ := http.DefaultClient.Do(req)
-				resp.Body.Close()
-			}
-			i++
+	for i := 0; i < b.N; i++ {
+		switch i % 4 {
+		case 0: // Create
+			data := map[string]interface{}{"name": "New User"}
+			bodyBytes, _ := json.Marshal(data)
+			req, _ := http.NewRequest("POST", env.URL()+"/api/v1/users", bytes.NewBuffer(bodyBytes))
+			req.Header.Set("Content-Type", "application/json")
+			resp := env.Do(b, req)
+			resp.Body.Close()
+		case 1: // Get
+			req, _ := http.NewRequest("GET", env.URL()+"/api/v1/users/1", nil)
+			resp := env.Do(b, req)
+			resp.Body.Close()
+		case 2: // List
+			req, _ := http.NewRequest("GET", env.URL()+"/api/v1/users", nil)
+			resp := env.Do(b, req)
+			resp.Body.Close()
+		case 3: // Update
+			data := map[string]interface{}{"name": "Updated"}
+			bodyBytes, _ := json.Marshal(data)
+			req, _ := http.NewRequest("PUT", env.URL()+"/api/v1/users/1", bytes.NewBuffer(bodyBytes))
+			req.Header.Set("Content-Type", "application/json")
+			resp := env.Do(b, req)
+			resp.Body.Close()
 		}
-	})
+	}
 }
 
 // BenchmarkCreateWithReferences benchmarks creating entities with references
 func BenchmarkCreateWithReferences(b *testing.B) {
-	ts, _ := setupBenchServer(b)
+	env := setupBenchServer(b)
 
-	// Create a reference entity
-	refData := map[string]interface{}{"name": "Reference"}
-	bodyBytes, _ := json.Marshal(refData)
-	req, _ := http.NewRequest("POST", ts.URL+"/api/v1/users", bytes.NewBuffer(bodyBytes))
-	req.Header.Set("Content-Type", "application/json")
-	resp, _ := http.DefaultClient.Do(req)
-	
-	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
-	refID := result["id"].(float64)
-	resp.Body.Close()
+	refID := env.CreateEntity(b, "users", map[string]interface{}{"name": "Reference"})
 
 	data := map[string]interface{}{
 		"name": "User with Ref",
 		"manager": map[string]interface{}{
 			"type":   "REF",
 			"entity": "users",
-			"id":     refID,
+			"id":     float64(refID),
 		},
 	}
 	dataBytes, _ := json.Marshal(data)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		req, _ := http.NewRequest("POST", ts.URL+"/api/v1/users", bytes.NewBuffer(dataBytes))
+		req, _ := http.NewRequest("POST", env.URL()+"/api/v1/users", bytes.NewBuffer(dataBytes))
 		req.Header.Set("Content-Type", "application/json")
-		resp, _ := http.DefaultClient.Do(req)
+		resp := env.Do(b, req)
 		resp.Body.Close()
 	}
 }

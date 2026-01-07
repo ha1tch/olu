@@ -7,7 +7,7 @@ MAIN_PATH=./cmd/olu
 MIGRATE_PATH=./cmd/olu-migrate
 
 # Build the application
-build:
+build: deps
 	@echo "Building ${BINARY_NAME}..."
 	@go build -o ${BINARY_NAME} ${MAIN_PATH}
 	@echo "Build complete: ${BINARY_NAME}"
@@ -30,80 +30,219 @@ run: build
 # Clean build artifacts
 clean:
 	@echo "Cleaning..."
-	@go clean
+	@go clean -testcache
 	@rm -f ${BINARY_NAME}
 	@rm -f ${MIGRATE_BINARY}
 	@rm -rf data/*
 	@rm -f *.db
+	@rm -f coverage.out coverage.html test-report.json
 	@echo "Clean complete"
 
-# Run tests
+# =============================================================================
+# Testing
+# =============================================================================
+
+# Run all tests (excludes stress tests)
 test:
 	@echo "Running tests..."
-	@go test -v ./...
+	@go test -short ./...
 
-# Run tests with coverage
-coverage:
-	@echo "Running tests with coverage..."
-	@go test -v -coverprofile=coverage.out ./...
-	@go tool cover -html=coverage.out -o coverage.html
-	@echo "Coverage report generated: coverage.html"
-
-# Run benchmarks
-benchmark:
-	@echo "Running benchmarks..."
-	@go test -bench=. -benchmem ./pkg/server/
-	@echo "Benchmark complete"
-
-# Run benchmarks with longer duration
-benchmark-long:
-	@echo "Running benchmarks (5s each)..."
-	@go test -bench=. -benchmem -benchtime=5s ./pkg/server/
-
-# Run specific benchmark
-benchmark-%:
-	@echo "Running benchmark $*..."
-	@go test -bench=$* -benchmem ./pkg/server/
+# Run all tests with verbose output
+test-v:
+	@echo "Running tests (verbose)..."
+	@go test -short -v ./...
 
 # Run tests with race detector
 test-race:
 	@echo "Running tests with race detector..."
-	@go test -race ./...
+	@go test -short -race ./...
 
-# Run unit tests only (storage layer)
-test-unit:
-	@echo "Running unit tests..."
-	@go test -v ./pkg/storage/
+# Run tests with coverage
+coverage:
+	@echo "Running tests with coverage..."
+	@go test -short -coverprofile=coverage.out ./...
+	@go tool cover -html=coverage.out -o coverage.html
+	@echo "Coverage report generated: coverage.html"
+
+# Quick test (no verbose, cached results ok)
+test-quick:
+	@go test -short ./...
+
+# Generate test report in JSON
+test-report:
+	@echo "Generating test report..."
+	@go test -short -v -json ./... > test-report.json
+	@echo "Test report: test-report.json"
+
+# =============================================================================
+# Package-specific tests
+# =============================================================================
+
+# Run storage tests
+test-storage:
+	@echo "Running storage tests..."
+	@go test -v ./pkg/storage/...
 
 # Run SQLite tests only
 test-sqlite:
 	@echo "Running SQLite tests..."
 	@go test -v ./pkg/storage/ -run TestSQLite
 
-# Run integration tests only
-test-integration:
-	@echo "Running integration tests..."
-	@go test -v ./pkg/server/
+# Run graph tests
+test-graph:
+	@echo "Running graph tests..."
+	@go test -v ./pkg/graph/...
 
-# Quick test (no verbose, cached results ok)
-test-quick:
-	@go test ./...
+# Run OQL tests
+test-oql:
+	@echo "Running OQL tests..."
+	@go test -v ./pkg/oql/...
 
-# Generate test report in JSON
-test-report:
-	@echo "Generating test report..."
-	@go test -v -json ./... > test-report.json
-	@echo "Test report: test-report.json"
+# Run Sulpher tests
+test-sulpher:
+	@echo "Running Sulpher tests..."
+	@go test -v ./pkg/sulpher/...
+
+# Run validation tests
+test-validation:
+	@echo "Running validation tests..."
+	@go test -v ./pkg/validation/...
+
+# Run server tests
+test-server:
+	@echo "Running server tests..."
+	@go test -v ./pkg/server/...
+
+# Run cache tests with Redis
+# Starts Redis container, runs tests, stops Redis
+test-redis:
+	@echo "Starting Redis container..."
+	@docker run -d --name olu-redis-test -p 6379:6379 redis:7-alpine > /dev/null 2>&1 || true
+	@sleep 1
+	@echo "Running Redis cache tests..."
+	@go test -v ./pkg/cache/... -run Redis; \
+	EXIT_CODE=$$?; \
+	echo "Stopping Redis container..."; \
+	docker stop olu-redis-test > /dev/null 2>&1 || true; \
+	docker rm olu-redis-test > /dev/null 2>&1 || true; \
+	exit $$EXIT_CODE
+
+# Run Redis stress tests (concurrent access, large payloads, pattern delete)
+test-redis-stress:
+	@echo "Starting Redis container..."
+	@docker run -d --name olu-redis-test -p 6379:6379 redis:7-alpine > /dev/null 2>&1 || true
+	@sleep 1
+	@echo "Running Redis stress tests..."
+	@go test -v ./pkg/cache/... -run RedisStress -timeout 120s; \
+	EXIT_CODE=$$?; \
+	echo "Stopping Redis container..."; \
+	docker stop olu-redis-test > /dev/null 2>&1 || true; \
+	docker rm olu-redis-test > /dev/null 2>&1 || true; \
+	exit $$EXIT_CODE
+
+# =============================================================================
+# Stress Tests
+# =============================================================================
+
+# Run all stress tests
+stress:
+	@echo "Running stress tests (10,000 records)..."
+	@go test -v -run TestStress ./pkg/storage/...
+
+# Run stress tests with race detector
+stress-race:
+	@echo "Running stress tests with race detector..."
+	@go test -v -race -run TestStress ./pkg/storage/...
+
+# Run individual stress tests
+stress-bulk:
+	@echo "Running bulk creation stress test..."
+	@go test -v -run TestStress_BulkCreation ./pkg/storage/...
+
+stress-workers:
+	@echo "Running concurrent workers stress test..."
+	@go test -v -run TestStress_ConcurrentWorkers ./pkg/storage/...
+
+stress-dashboard:
+	@echo "Running dashboard queries stress test..."
+	@go test -v -run TestStress_DashboardQueries ./pkg/storage/...
+
+stress-mixed:
+	@echo "Running mixed workload stress test..."
+	@go test -v -run TestStress_MixedWorkload ./pkg/storage/...
+
+# =============================================================================
+# Benchmarks
+# =============================================================================
+
+# Run all benchmarks
+bench:
+	@echo "Running all benchmarks..."
+	@go test -bench=. -benchmem -run=^$$ ./...
+
+# Run benchmarks with longer duration
+bench-long:
+	@echo "Running benchmarks (5s each)..."
+	@go test -bench=. -benchmem -benchtime=5s -run=^$$ ./...
+
+# Run OQL benchmarks
+bench-oql:
+	@echo "Running OQL benchmarks..."
+	@go test -bench=. -benchmem -run=^$$ ./pkg/oql/...
+
+# Run storage benchmarks
+bench-storage:
+	@echo "Running storage benchmarks..."
+	@go test -bench=. -benchmem -run=^$$ ./pkg/storage/...
+
+# Run stress benchmarks (10k records)
+bench-stress:
+	@echo "Running stress benchmarks (10k records)..."
+	@go test -bench=BenchmarkStress -benchmem -run=^$$ ./pkg/storage/...
+
+# Run server benchmarks
+bench-server:
+	@echo "Running server benchmarks..."
+	@go test -bench=. -benchmem -run=^$$ ./pkg/server/...
+
+# Run Sulpher benchmarks
+bench-sulpher:
+	@echo "Running Sulpher benchmarks..."
+	@go test -bench=. -benchmem -run=^$$ ./pkg/sulpher/...
+
+# Run specific benchmark by name
+bench-%:
+	@echo "Running benchmark $*..."
+	@go test -bench=$* -benchmem -run=^$$ ./...
+
+# =============================================================================
+# Combined targets
+# =============================================================================
+
+# Full test suite (tests + stress + race detection)
+test-full: test stress-race
+	@echo "✓ Full test suite passed!"
 
 # All checks before commit
 pre-commit: clean build test test-race
 	@echo "✓ All pre-commit checks passed!"
 
+# CI pipeline simulation
+ci: clean deps build test-race bench
+	@echo "✓ CI pipeline passed!"
+
+# =============================================================================
+# Development
+# =============================================================================
+
 # Install dependencies
+# Install dependencies
+# GONOSUMDB=* skips checksum verification for consistent behaviour
+# across Go versions (1.22, 1.24, etc.)
 deps:
 	@echo "Installing dependencies..."
-	@go mod download
-	@go mod tidy
+	@GONOSUMDB=* go mod download
+	@echo "Dependencies installed"
 
 # Format code
 fmt:
@@ -144,7 +283,41 @@ docker-run:
 	@echo "Running Docker container..."
 	@docker run -p 9090:9090 -v $(PWD)/data:/app/data olu:latest
 
+# Docker Compose - basic (memory cache, no auth)
+docker-up:
+	@echo "Starting Olu (basic)..."
+	@docker compose up -d olu
+
+# Docker Compose - with Redis cache
+docker-up-redis:
+	@echo "Starting Olu with Redis..."
+	@docker compose --profile redis up -d
+
+# Docker Compose - full features (Redis, SQLite+FTS, auth, rate limiting)
+docker-up-full:
+	@echo "Starting Olu with all features..."
+	@docker compose --profile full up -d
+
+# Docker Compose - run integration tests
+docker-test:
+	@echo "Running Docker integration tests..."
+	@docker compose --profile test up --build --abort-on-container-exit test-runner
+	@docker compose --profile test down -v
+
+# Docker Compose - stop all
+docker-down:
+	@echo "Stopping all containers..."
+	@docker compose --profile redis --profile full --profile test down
+
+# Docker Compose - stop and clean volumes
+docker-clean:
+	@echo "Stopping containers and removing volumes..."
+	@docker compose --profile redis --profile full --profile test down -v
+
+# =============================================================================
 # Help
+# =============================================================================
+
 help:
 	@echo "Available targets:"
 	@echo ""
@@ -152,35 +325,63 @@ help:
 	@echo "  build           - Build the application"
 	@echo "  build-migrate   - Build migration tool"
 	@echo "  build-all-tools - Build all binaries"
+	@echo "  build-all       - Build for multiple platforms"
 	@echo "  run             - Build and run the application"
 	@echo "  clean           - Remove build artifacts and data"
 	@echo "  install         - Install binary"
-	@echo "  build-all       - Build for multiple platforms"
 	@echo ""
 	@echo "Testing:"
-	@echo "  test            - Run all tests"
-	@echo "  test-unit       - Run unit tests (storage layer)"
-	@echo "  test-sqlite     - Run SQLite tests only"
-	@echo "  test-integration - Run integration tests (server)"
+	@echo "  test            - Run all tests (excludes stress)"
+	@echo "  test-v          - Run all tests (verbose)"
 	@echo "  test-race       - Run tests with race detector"
 	@echo "  test-quick      - Quick test run (cached results)"
-	@echo "  test-report     - Generate JSON test report"
+	@echo "  test-full       - Full test suite (tests + stress + race)"
 	@echo "  coverage        - Run tests with coverage report"
+	@echo "  test-report     - Generate JSON test report"
 	@echo ""
-	@echo "Benchmarking:"
-	@echo "  benchmark       - Run all benchmarks"
-	@echo "  benchmark-long  - Run benchmarks with 5s duration"
-	@echo "  benchmark-NAME  - Run specific benchmark"
+	@echo "Package Tests:"
+	@echo "  test-storage    - Run storage tests"
+	@echo "  test-sqlite     - Run SQLite tests only"
+	@echo "  test-graph      - Run graph tests"
+	@echo "  test-oql        - Run OQL tests"
+	@echo "  test-sulpher    - Run Sulpher tests"
+	@echo "  test-validation - Run validation tests"
+	@echo "  test-server     - Run server tests"
+	@echo "  test-redis      - Run Redis cache tests (starts/stops Redis container)"
+	@echo "  test-redis-stress - Run Redis stress tests (concurrent, large payloads)"
+	@echo ""
+	@echo "Stress Tests (10,000 records):"
+	@echo "  stress          - Run all stress tests"
+	@echo "  stress-race     - Run stress tests with race detector"
+	@echo "  stress-bulk     - Bulk record creation"
+	@echo "  stress-workers - Concurrent worker simulation"
+	@echo "  stress-dashboard - Dashboard query patterns"
+	@echo "  stress-mixed    - Mixed workload simulation"
+	@echo ""
+	@echo "Benchmarks:"
+	@echo "  bench           - Run all benchmarks"
+	@echo "  bench-long      - Run benchmarks (5s duration)"
+	@echo "  bench-oql       - OQL benchmarks"
+	@echo "  bench-storage   - Storage benchmarks"
+	@echo "  bench-stress    - Stress benchmarks (10k records)"
+	@echo "  bench-server    - Server benchmarks"
+	@echo "  bench-sulpher   - Sulpher benchmarks"
+	@echo "  bench-NAME      - Run specific benchmark"
 	@echo ""
 	@echo "Development:"
-	@echo "  deps        - Install dependencies"
-	@echo "  fmt         - Format code"
-	@echo "  lint        - Run linter"
-	@echo "  dev         - Run in development mode with auto-reload"
-	@echo "  pre-commit  - Run all checks before committing"
+	@echo "  deps            - Install dependencies"
+	@echo "  fmt             - Format code"
+	@echo "  lint            - Run linter"
+	@echo "  dev             - Run with auto-reload"
+	@echo "  pre-commit      - Run all checks before committing"
+	@echo "  ci              - Simulate CI pipeline"
 	@echo ""
 	@echo "Docker:"
-	@echo "  docker-build - Build Docker image"
-	@echo "  docker-run   - Run Docker container"
-	@echo ""
-	@echo "  help        - Show this help message"
+	@echo "  docker-build    - Build Docker image"
+	@echo "  docker-run      - Run Docker container"
+	@echo "  docker-up       - Start basic Olu (memory cache, no auth)"
+	@echo "  docker-up-redis - Start Olu with Redis cache"
+	@echo "  docker-up-full  - Start Olu with all features"
+	@echo "  docker-test     - Run integration tests in Docker"
+	@echo "  docker-down     - Stop all containers"
+	@echo "  docker-clean    - Stop containers and remove volumes"

@@ -329,3 +329,12 @@ func (s *JSONFileStore) Search(ctx context.Context, entity string, field string,
 	
 	return results, nil
 }
+
+
+// FullTextSearch is not supported for JSONFileStore, returns empty results
+func (s *JSONFileStore) FullTextSearch(ctx context.Context, query string, entity string) ([]map[string]interface{}, error) {
+	// Full-text search requires SQLite FTS5
+	// For JSONFileStore, fall back to basic search or return empty
+	return []map[string]interface{}{}, nil
+}
+

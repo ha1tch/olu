@@ -76,6 +76,7 @@ func init() {
 			EnableForeignKeys: true,
 			CacheSize:        2000, // 2MB
 			BusyTimeout:      5000, // 5 seconds
+			FullTextEnabled:  false,
 		}
 		
 		// Allow overriding config options
@@ -90,6 +91,9 @@ func init() {
 		}
 		if timeout, ok := config["busy_timeout"].(int); ok {
 			sqliteConfig.BusyTimeout = timeout
+		}
+		if fts, ok := config["full_text_enabled"].(bool); ok {
+			sqliteConfig.FullTextEnabled = fts
 		}
 		
 		return NewSQLiteStore(dbPath, sqliteConfig)
@@ -162,6 +166,14 @@ func (pt *pseudoTransaction) List(ctx context.Context, entity string) ([]map[str
 
 func (pt *pseudoTransaction) Exists(ctx context.Context, entity string, id int) bool {
 	return pt.store.Exists(ctx, entity, id)
+}
+
+func (pt *pseudoTransaction) Search(ctx context.Context, entity string, field string, query string, matchType string) ([]map[string]interface{}, error) {
+	return pt.store.Search(ctx, entity, field, query, matchType)
+}
+
+func (pt *pseudoTransaction) FullTextSearch(ctx context.Context, query string, entity string) ([]map[string]interface{}, error) {
+	return pt.store.FullTextSearch(ctx, query, entity)
 }
 
 func (pt *pseudoTransaction) Close() error {

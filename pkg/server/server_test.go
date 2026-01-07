@@ -22,10 +22,11 @@ import (
 
 // TestServer holds test server instance and helpers
 type TestServer struct {
-	server *server.Server
-	ts     *httptest.Server
-	cfg    *config.Config
-	t      *testing.T
+	server      *server.Server
+	ts          *httptest.Server
+	cfg         *config.Config
+	t           *testing.T
+	sqliteStore storage.Store // Optional, for SQLite-based tests
 }
 
 // setupTestServer creates a test server with temporary storage
@@ -41,6 +42,7 @@ func setupTestServer(t *testing.T) *TestServer {
 		Port:               0, // Let httptest choose port
 		BaseDir:            tmpDir,
 		Schema:             "test_schema",
+		SchemaDir:          filepath.Join(tmpDir, "test_schema"), // For OQL entity discovery
 		CacheType:          "memory",
 		CacheTTL:           300,
 		GraphEnabled:       true,
@@ -73,7 +75,7 @@ func setupTestServer(t *testing.T) *TestServer {
 	validator := validation.NewJSONSchemaValidator(schemaDir)
 	logger := zerolog.New(os.Stdout).Level(zerolog.Disabled)
 
-	srv := server.New(cfg, store, memCache, g, validator, logger)
+	srv := server.New(cfg, store, memCache, g, nil, validator, logger)
 	ts := httptest.NewServer(srv.Handler())
 
 	return &TestServer{
@@ -87,6 +89,9 @@ func setupTestServer(t *testing.T) *TestServer {
 // cleanup removes temporary test data
 func (ts *TestServer) cleanup() {
 	ts.ts.Close()
+	if ts.sqliteStore != nil {
+		ts.sqliteStore.Close()
+	}
 	os.RemoveAll(ts.cfg.BaseDir)
 }
 
@@ -612,6 +617,827 @@ func TestErrorHandling(t *testing.T) {
 		resp, _ := http.DefaultClient.Do(req)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("Expected 400, got %d", resp.StatusCode)
+		}
+	})
+}
+
+// ============================================================================
+// Full-Text Search Endpoint Tests
+// ============================================================================
+
+// setupTestServerWithFTS creates a test server with SQLite and FTS enabled
+func setupTestServerWithFTS(t *testing.T) *TestServer {
+	tmpDir, err := os.MkdirTemp("", "olu-fts-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(tmpDir, "test.db")
+
+	cfg := &config.Config{
+		Host:               "localhost",
+		Port:               0,
+		StorageType:        "sqlite",
+		DBPath:             dbPath,
+		BaseDir:            tmpDir,
+		Schema:             "test_schema",
+		CacheType:          "memory",
+		CacheTTL:           300,
+		GraphEnabled:       true,
+		GraphMode:          "indexed",
+		FullTextEnabled:    true,
+		CascadingDelete:    false,
+		RefEmbedDepth:      3,
+		MaxEmbedDepth:      10,
+		MaxEntitySize:      1048576,
+		PatchNullBehavior:  "store",
+		GraphDataFile:      filepath.Join(tmpDir, "graph.data"),
+		GraphIndexFile:     filepath.Join(tmpDir, "graph.index"),
+		MaxCascadeDeletions: 100,
+	}
+
+	storeConfig := map[string]interface{}{
+		"db_path":           dbPath,
+		"full_text_enabled": true,
+	}
+
+	store, err := storage.NewStore("sqlite", storeConfig)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		t.Fatal(err)
+	}
+
+	memCache := cache.NewMemoryCache(1000, time.Duration(cfg.CacheTTL)*time.Second)
+	g := graph.NewIndexedGraph()
+	schemaDir := filepath.Join(cfg.BaseDir, cfg.Schema, "_schemas")
+	validator := validation.NewJSONSchemaValidator(schemaDir)
+	logger := zerolog.New(os.Stdout).Level(zerolog.Disabled)
+
+	srv := server.New(cfg, store, memCache, g, nil, validator, logger)
+	httpServer := httptest.NewServer(srv.Handler())
+
+	// Store the store reference for cleanup
+	testServer := &TestServer{
+		server: srv,
+		ts:     httpServer,
+		cfg:    cfg,
+		t:      t,
+	}
+	// Override cleanup to also close SQLite
+	testServer.sqliteStore = store
+	return testServer
+}
+
+func TestFullTextSearchEndpoint(t *testing.T) {
+	ts := setupTestServerWithFTS(t)
+	defer ts.cleanup()
+
+	// Create test data
+	ts.doRequest("POST", "/api/v1/users", map[string]interface{}{
+		"name":  "Alice Engineer",
+		"email": "alice@example.com",
+		"bio":   "Software developer who loves Go programming",
+	})
+	ts.doRequest("POST", "/api/v1/users", map[string]interface{}{
+		"name":  "Bob Manager",
+		"email": "bob@example.com",
+		"bio":   "Product manager with technical background",
+	})
+	ts.doRequest("POST", "/api/v1/posts", map[string]interface{}{
+		"title":   "Go Programming Tips",
+		"content": "Learn Go programming effectively",
+	})
+
+	t.Run("Search without query returns error", func(t *testing.T) {
+		resp, _ := ts.doRequest("GET", "/api/v1/search", nil)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("Expected 400 for missing query, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("Search across all entities", func(t *testing.T) {
+		resp, body := ts.doRequest("GET", "/api/v1/search?q=programming", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected 200, got %d. Body: %s", resp.StatusCode, string(body))
+		}
+
+		var result map[string]interface{}
+		json.Unmarshal(body, &result)
+
+		countVal, ok := result["count"].(float64)
+		if !ok {
+			t.Fatalf("Expected count in response, got: %v", result)
+		}
+		count := int(countVal)
+		if count != 2 {
+			t.Errorf("Expected 2 results for 'programming', got %d", count)
+		}
+	})
+
+	t.Run("Search within entity type", func(t *testing.T) {
+		resp, body := ts.doRequest("GET", "/api/v1/search?q=programming&entity=users", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected 200, got %d. Body: %s", resp.StatusCode, string(body))
+		}
+
+		var result map[string]interface{}
+		json.Unmarshal(body, &result)
+
+		countVal, ok := result["count"].(float64)
+		if !ok {
+			t.Fatalf("Expected count in response, got: %v", result)
+		}
+		count := int(countVal)
+		if count != 1 {
+			t.Errorf("Expected 1 result for 'programming' in users, got %d", count)
+		}
+	})
+
+	t.Run("Search with no matches", func(t *testing.T) {
+		resp, body := ts.doRequest("GET", "/api/v1/search?q=xyznonexistent", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected 200, got %d. Body: %s", resp.StatusCode, string(body))
+		}
+
+		var result map[string]interface{}
+		json.Unmarshal(body, &result)
+
+		countVal, ok := result["count"].(float64)
+		if !ok {
+			t.Fatalf("Expected count in response, got: %v", result)
+		}
+		count := int(countVal)
+		if count != 0 {
+			t.Errorf("Expected 0 results for nonexistent term, got %d", count)
+		}
+	})
+}
+
+func TestFullTextSearchDisabled(t *testing.T) {
+	// Use regular setup (FTS disabled)
+	ts := setupTestServer(t)
+	defer ts.cleanup()
+
+	resp, _ := ts.doRequest("GET", "/api/v1/search?q=test", nil)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("Expected 503 when FTS disabled, got %d", resp.StatusCode)
+	}
+}
+
+// ============================================================================
+// REF Embed Depth Tests
+// ============================================================================
+
+func TestRefEmbedDepth(t *testing.T) {
+	ts := setupTestServer(t)
+	defer ts.cleanup()
+
+	// Create a chain of references: user1 -> user2 -> user3
+	_, body1 := ts.doRequest("POST", "/api/v1/users", map[string]interface{}{
+		"name": "User 3 (deepest)",
+	})
+	var u3 map[string]interface{}
+	json.Unmarshal(body1, &u3)
+	id3 := int(u3["id"].(float64))
+
+	_, body2 := ts.doRequest("POST", "/api/v1/users", map[string]interface{}{
+		"name": "User 2 (middle)",
+		"manager": map[string]interface{}{
+			"type":   "REF",
+			"entity": "users",
+			"id":     id3,
+		},
+	})
+	var u2 map[string]interface{}
+	json.Unmarshal(body2, &u2)
+	id2 := int(u2["id"].(float64))
+
+	ts.doRequest("POST", "/api/v1/users", map[string]interface{}{
+		"name": "User 1 (top)",
+		"manager": map[string]interface{}{
+			"type":   "REF",
+			"entity": "users",
+			"id":     id2,
+		},
+	})
+
+	t.Run("Default embedding resolves refs", func(t *testing.T) {
+		resp, body := ts.doRequest("GET", "/api/v1/users/3", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected 200, got %d", resp.StatusCode)
+		}
+
+		var result map[string]interface{}
+		json.Unmarshal(body, &result)
+
+		// Manager should be embedded (not a REF object)
+		manager, ok := result["manager"].(map[string]interface{})
+		if !ok {
+			t.Fatal("Expected manager to be embedded object")
+		}
+		if manager["type"] == "REF" {
+			t.Error("Expected manager to be resolved, not REF")
+		}
+		if manager["name"] != "User 2 (middle)" {
+			t.Errorf("Expected manager name 'User 2 (middle)', got %v", manager["name"])
+		}
+	})
+
+	t.Run("embed=false disables embedding", func(t *testing.T) {
+		resp, body := ts.doRequest("GET", "/api/v1/users/3?embed=false", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected 200, got %d", resp.StatusCode)
+		}
+
+		var result map[string]interface{}
+		json.Unmarshal(body, &result)
+
+		// Manager should be a REF object
+		manager, ok := result["manager"].(map[string]interface{})
+		if !ok {
+			t.Fatal("Expected manager field")
+		}
+		if manager["type"] != "REF" {
+			t.Error("Expected manager to be REF when embed=false")
+		}
+	})
+
+	t.Run("embed_depth=1 limits depth", func(t *testing.T) {
+		resp, body := ts.doRequest("GET", "/api/v1/users/3?embed_depth=1", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected 200, got %d", resp.StatusCode)
+		}
+
+		var result map[string]interface{}
+		json.Unmarshal(body, &result)
+
+		// First level should be embedded
+		manager, ok := result["manager"].(map[string]interface{})
+		if !ok || manager["type"] == "REF" {
+			t.Error("Expected first level manager to be embedded")
+		}
+
+		// Second level should still be REF (depth exhausted)
+		nestedManager, ok := manager["manager"].(map[string]interface{})
+		if ok && nestedManager["type"] != "REF" {
+			t.Error("Expected nested manager to remain as REF at depth 1")
+		}
+	})
+}
+
+// ============================================================================
+// OQL Endpoint Tests
+// ============================================================================
+
+func TestOQLQueryEndpoint(t *testing.T) {
+	// Create temp directory with pre-existing entity folders
+	// so OQL validator recognizes them at startup
+	tmpDir, err := os.MkdirTemp("", "olu-oql-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Pre-create entity directories so OQL validator finds them
+	usersDir := filepath.Join(tmpDir, "test_schema", "users")
+	if err := os.MkdirAll(usersDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Host:                "localhost",
+		Port:                0,
+		BaseDir:             tmpDir,
+		Schema:              "test_schema",
+		SchemaDir:           filepath.Join(tmpDir, "test_schema"),
+		CacheType:           "memory",
+		CacheTTL:            300,
+		GraphEnabled:        true,
+		GraphMode:           "indexed",
+		FullTextEnabled:     false,
+		RefEmbedDepth:       3,
+		MaxEmbedDepth:       10,
+		MaxEntitySize:       1048576,
+		PatchNullBehavior:   "store",
+		GraphDataFile:       filepath.Join(tmpDir, "graph.data"),
+		GraphIndexFile:      filepath.Join(tmpDir, "graph.index"),
+		MaxCascadeDeletions: 100,
+	}
+
+	storeConfig := map[string]interface{}{
+		"base_dir": cfg.BaseDir,
+		"schema":   cfg.Schema,
+	}
+	store, _ := storage.NewStore("jsonfile", storeConfig)
+	memCache := cache.NewMemoryCache(1000, time.Second*300)
+	g := graph.NewIndexedGraph()
+	schemaDir := filepath.Join(cfg.BaseDir, cfg.Schema, "_schemas")
+	validator := validation.NewJSONSchemaValidator(schemaDir)
+	logger := zerolog.New(os.Stdout).Level(zerolog.Disabled)
+
+	srv := server.New(cfg, store, memCache, g, nil, validator, logger)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	doReq := func(method, path string, body interface{}) (*http.Response, []byte) {
+		var bodyBytes []byte
+		if body != nil {
+			bodyBytes, _ = json.Marshal(body)
+		}
+		req, _ := http.NewRequest(method, ts.URL+path, bytes.NewBuffer(bodyBytes))
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, _ := http.DefaultClient.Do(req)
+		defer resp.Body.Close()
+		respBody := &bytes.Buffer{}
+		respBody.ReadFrom(resp.Body)
+		return resp, respBody.Bytes()
+	}
+
+	// Create test data
+	doReq("POST", "/api/v1/users", map[string]interface{}{"name": "Alice", "age": 30})
+	doReq("POST", "/api/v1/users", map[string]interface{}{"name": "Bob", "age": 25})
+	doReq("POST", "/api/v1/users", map[string]interface{}{"name": "Carol", "age": 35})
+
+	t.Run("Basic SELECT query", func(t *testing.T) {
+		resp, body := doReq("POST", "/api/v1/oql/query", map[string]interface{}{
+			"query": "SELECT * FROM users",
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Expected 200, got %d. Body: %s", resp.StatusCode, string(body))
+			return
+		}
+
+		var result map[string]interface{}
+		json.Unmarshal(body, &result)
+
+		data, ok := result["data"].([]interface{})
+		if !ok {
+			t.Fatalf("Expected data array, got: %v", result)
+		}
+		if len(data) != 3 {
+			t.Errorf("Expected 3 results, got %d", len(data))
+		}
+	})
+
+	t.Run("SELECT with WHERE", func(t *testing.T) {
+		resp, body := doReq("POST", "/api/v1/oql/query", map[string]interface{}{
+			"query": "SELECT * FROM users WHERE age > 28",
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Expected 200, got %d", resp.StatusCode)
+			return
+		}
+
+		var result map[string]interface{}
+		json.Unmarshal(body, &result)
+
+		data, ok := result["data"].([]interface{})
+		if !ok {
+			t.Fatalf("Expected data array")
+		}
+		if len(data) != 2 {
+			t.Errorf("Expected 2 results (age > 28), got %d", len(data))
+		}
+	})
+
+	t.Run("SELECT with ORDER BY", func(t *testing.T) {
+		resp, body := doReq("POST", "/api/v1/oql/query", map[string]interface{}{
+			"query": "SELECT name FROM users ORDER BY age DESC",
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Expected 200, got %d", resp.StatusCode)
+			return
+		}
+
+		var result map[string]interface{}
+		json.Unmarshal(body, &result)
+
+		data, ok := result["data"].([]interface{})
+		if !ok || len(data) == 0 {
+			t.Fatalf("Expected non-empty data array")
+		}
+		first := data[0].(map[string]interface{})
+		if first["name"] != "Carol" {
+			t.Errorf("Expected Carol first (oldest), got %v", first["name"])
+		}
+	})
+
+	t.Run("SELECT with LIMIT", func(t *testing.T) {
+		resp, body := doReq("POST", "/api/v1/oql/query", map[string]interface{}{
+			"query": "SELECT TOP 2 * FROM users",
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Expected 200, got %d", resp.StatusCode)
+			return
+		}
+
+		var result map[string]interface{}
+		json.Unmarshal(body, &result)
+
+		data, ok := result["data"].([]interface{})
+		if !ok {
+			t.Fatalf("Expected data array")
+		}
+		if len(data) != 2 {
+			t.Errorf("Expected 2 results with TOP 2, got %d", len(data))
+		}
+	})
+
+	t.Run("Invalid query", func(t *testing.T) {
+		resp, _ := doReq("POST", "/api/v1/oql/query", map[string]interface{}{
+			"query": "INVALID QUERY SYNTAX",
+		})
+		if resp.StatusCode == http.StatusOK {
+			t.Error("Expected error for invalid query")
+		}
+	})
+
+	t.Run("Empty query", func(t *testing.T) {
+		resp, _ := doReq("POST", "/api/v1/oql/query", map[string]interface{}{
+			"query": "",
+		})
+		if resp.StatusCode == http.StatusOK {
+			t.Error("Expected error for empty query")
+		}
+	})
+}
+
+func TestOQLAsyncEndpoint(t *testing.T) {
+	// Create temp directory with pre-existing entity folders
+	tmpDir, err := os.MkdirTemp("", "olu-oql-async-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Pre-create entity directory
+	usersDir := filepath.Join(tmpDir, "test_schema", "users")
+	if err := os.MkdirAll(usersDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Host:                "localhost",
+		Port:                0,
+		BaseDir:             tmpDir,
+		Schema:              "test_schema",
+		SchemaDir:           filepath.Join(tmpDir, "test_schema"),
+		CacheType:           "memory",
+		CacheTTL:            300,
+		GraphEnabled:        true,
+		GraphMode:           "indexed",
+		RefEmbedDepth:       3,
+		MaxEmbedDepth:       10,
+		MaxEntitySize:       1048576,
+		PatchNullBehavior:   "store",
+		GraphDataFile:       filepath.Join(tmpDir, "graph.data"),
+		GraphIndexFile:      filepath.Join(tmpDir, "graph.index"),
+		MaxCascadeDeletions: 100,
+		GraphQueryTTL:       3600,
+	}
+
+	storeConfig := map[string]interface{}{
+		"base_dir": cfg.BaseDir,
+		"schema":   cfg.Schema,
+	}
+	store, _ := storage.NewStore("jsonfile", storeConfig)
+	memCache := cache.NewMemoryCache(1000, time.Second*300)
+	g := graph.NewIndexedGraph()
+	schemaDir := filepath.Join(cfg.BaseDir, cfg.Schema, "_schemas")
+	validator := validation.NewJSONSchemaValidator(schemaDir)
+	logger := zerolog.New(os.Stdout).Level(zerolog.Disabled)
+
+	srv := server.New(cfg, store, memCache, g, nil, validator, logger)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	doReq := func(method, path string, body interface{}) (*http.Response, []byte) {
+		var bodyBytes []byte
+		if body != nil {
+			bodyBytes, _ = json.Marshal(body)
+		}
+		req, _ := http.NewRequest(method, ts.URL+path, bytes.NewBuffer(bodyBytes))
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, _ := http.DefaultClient.Do(req)
+		defer resp.Body.Close()
+		respBody := &bytes.Buffer{}
+		respBody.ReadFrom(resp.Body)
+		return resp, respBody.Bytes()
+	}
+
+	// Create test data
+	doReq("POST", "/api/v1/users", map[string]interface{}{"name": "Test"})
+
+	t.Run("Submit async query", func(t *testing.T) {
+		resp, body := doReq("POST", "/api/v1/oql/query/async", map[string]interface{}{
+			"query": "SELECT * FROM users",
+		})
+		if resp.StatusCode != http.StatusAccepted {
+			t.Errorf("Expected 202, got %d. Body: %s", resp.StatusCode, string(body))
+			return
+		}
+
+		var result map[string]interface{}
+		json.Unmarshal(body, &result)
+
+		queryID, ok := result["query_id"].(string)
+		if !ok || queryID == "" {
+			t.Errorf("Expected query_id in response, got: %v", result)
+		}
+	})
+}
+
+// ============================================================================
+// Sulpher Endpoint Tests
+// ============================================================================
+
+func TestSulpherQueryEndpoint(t *testing.T) {
+	ts := setupTestServer(t)
+	defer ts.cleanup()
+
+	// Create connected entities
+	ts.doRequest("POST", "/api/v1/users", map[string]interface{}{
+		"name": "Alice",
+	})
+	ts.doRequest("POST", "/api/v1/posts", map[string]interface{}{
+		"title": "Hello",
+		"author": map[string]interface{}{
+			"type":   "REF",
+			"entity": "users",
+			"id":     1,
+		},
+	})
+
+	t.Run("Basic path query", func(t *testing.T) {
+		resp, body := ts.doRequest("POST", "/api/v1/graph/query", map[string]interface{}{
+			"query": "MATCH (u:users) RETURN u",
+		})
+		// Sulpher queries may return 200 even with no results
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+			t.Errorf("Expected 200 or 202, got %d. Body: %s", resp.StatusCode, string(body))
+		}
+	})
+
+	t.Run("Invalid query", func(t *testing.T) {
+		resp, _ := ts.doRequest("POST", "/api/v1/graph/query", map[string]interface{}{
+			"query": "",
+		})
+		if resp.StatusCode == http.StatusOK {
+			t.Error("Expected error for empty query")
+		}
+	})
+}
+
+// ============================================================================
+// Multi-Tenant Tests
+// ============================================================================
+
+func TestTenantIsolation(t *testing.T) {
+	ts := setupTestServer(t)
+	defer ts.cleanup()
+
+	// Create entities in tenant1
+	ts.doRequest("POST", "/api/v1/tenant/tenant1/users", map[string]interface{}{
+		"name": "Alice",
+	})
+	ts.doRequest("POST", "/api/v1/tenant/tenant1/users", map[string]interface{}{
+		"name": "Bob",
+	})
+
+	// Create entity in tenant2
+	ts.doRequest("POST", "/api/v1/tenant/tenant2/users", map[string]interface{}{
+		"name": "Carol",
+	})
+
+	t.Run("List only shows tenant's data", func(t *testing.T) {
+		resp, body := ts.doRequest("GET", "/api/v1/tenant/tenant1/users", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected 200, got %d", resp.StatusCode)
+		}
+
+		var result map[string]interface{}
+		json.Unmarshal(body, &result)
+
+		data := result["data"].([]interface{})
+		if len(data) != 2 {
+			t.Errorf("Expected 2 users in tenant1, got %d", len(data))
+		}
+	})
+
+	t.Run("Get from wrong tenant returns 404", func(t *testing.T) {
+		// Entity 1 is in tenant1, try to access from tenant2
+		resp, _ := ts.doRequest("GET", "/api/v1/tenant/tenant2/users/1", nil)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("Expected 404 for cross-tenant access, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("Update in wrong tenant fails", func(t *testing.T) {
+		resp, _ := ts.doRequest("PUT", "/api/v1/tenant/tenant2/users/1", map[string]interface{}{
+			"name": "Hacked",
+		})
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("Expected 404 for cross-tenant update, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("Delete in wrong tenant fails", func(t *testing.T) {
+		resp, _ := ts.doRequest("DELETE", "/api/v1/tenant/tenant2/users/1", nil)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("Expected 404 for cross-tenant delete, got %d", resp.StatusCode)
+		}
+	})
+}
+
+// ============================================================================
+// Additional Server Tests
+// ============================================================================
+
+func TestMetricsEndpoint(t *testing.T) {
+	ts := setupTestServer(t)
+	defer ts.cleanup()
+
+	t.Run("Prometheus format", func(t *testing.T) {
+		req, _ := http.NewRequest("GET", ts.ts.URL+"/metrics", nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		// Metrics may be disabled in test config
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("Expected 200 or 503, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("JSON format", func(t *testing.T) {
+		req, _ := http.NewRequest("GET", ts.ts.URL+"/metrics", nil)
+		req.Header.Set("Accept", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("Expected 200 or 503, got %d", resp.StatusCode)
+		}
+	})
+}
+
+func TestExportEndpoint(t *testing.T) {
+	ts := setupTestServer(t)
+	defer ts.cleanup()
+
+	// Create some data
+	ts.doRequest("POST", "/api/v1/users", map[string]interface{}{
+		"name": "Alice",
+	})
+
+	resp, body := ts.doRequest("GET", "/api/v1/export", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected 200, got %d. Body: %s", resp.StatusCode, string(body))
+	}
+
+	// Check content type is zip
+	contentType := resp.Header.Get("Content-Type")
+	if contentType != "application/zip" {
+		t.Errorf("Expected Content-Type application/zip, got %s", contentType)
+	}
+}
+
+func TestSearchEndpoint(t *testing.T) {
+	// Full-text search requires SQLite with FTS enabled
+	// These tests verify the endpoint behavior with FTS disabled
+	ts := setupTestServer(t)
+	defer ts.cleanup()
+
+	// Create test data
+	ts.doRequest("POST", "/api/v1/users", map[string]interface{}{
+		"name":  "Alice Smith",
+		"email": "alice@example.com",
+	})
+
+	t.Run("Full-text search disabled returns 503", func(t *testing.T) {
+		resp, body := ts.doRequest("GET", "/api/v1/search?q=Alice", nil)
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("Expected 503 (FTS disabled), got %d. Body: %s", resp.StatusCode, string(body))
+		}
+	})
+
+	t.Run("Full-text search missing query returns 400", func(t *testing.T) {
+		resp, _ := ts.doRequest("GET", "/api/v1/search", nil)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("Expected 400 for missing query, got %d", resp.StatusCode)
+		}
+	})
+}
+
+// ============================================================================
+// Tenant Strict Mode Tests
+// ============================================================================
+
+func TestTenantStrictMode(t *testing.T) {
+	// Create temp directory
+	tmpDir, err := os.MkdirTemp("", "olu-tenant-strict-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &config.Config{
+		Host:                "localhost",
+		Port:                0,
+		BaseDir:             tmpDir,
+		Schema:              "test_schema",
+		SchemaDir:           filepath.Join(tmpDir, "test_schema"),
+		CacheType:           "memory",
+		CacheTTL:            300,
+		GraphEnabled:        true,
+		GraphMode:           "indexed",
+		RefEmbedDepth:       3,
+		MaxEmbedDepth:       10,
+		MaxEntitySize:       1048576,
+		PatchNullBehavior:   "store",
+		GraphDataFile:       filepath.Join(tmpDir, "graph.data"),
+		GraphIndexFile:      filepath.Join(tmpDir, "graph.index"),
+		MaxCascadeDeletions: 100,
+		TenantMode:          "strict", // Enable strict mode
+		AuthType:            "none",
+	}
+
+	storeConfig := map[string]interface{}{
+		"base_dir": cfg.BaseDir,
+		"schema":   cfg.Schema,
+	}
+	store, _ := storage.NewStore("jsonfile", storeConfig)
+	memCache := cache.NewMemoryCache(1000, time.Second*300)
+	g := graph.NewIndexedGraph()
+	schemaDir := filepath.Join(cfg.BaseDir, cfg.Schema, "_schemas")
+	validator := validation.NewJSONSchemaValidator(schemaDir)
+	logger := zerolog.New(os.Stdout).Level(zerolog.Disabled)
+
+	srv := server.New(cfg, store, memCache, g, nil, validator, logger)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	doReq := func(method, path string, body interface{}) (*http.Response, []byte) {
+		var bodyBytes []byte
+		if body != nil {
+			bodyBytes, _ = json.Marshal(body)
+		}
+		req, _ := http.NewRequest(method, ts.URL+path, bytes.NewBuffer(bodyBytes))
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, _ := http.DefaultClient.Do(req)
+		defer resp.Body.Close()
+		respBody := &bytes.Buffer{}
+		respBody.ReadFrom(resp.Body)
+		return resp, respBody.Bytes()
+	}
+
+	t.Run("Non-tenant entity route blocked", func(t *testing.T) {
+		resp, _ := doReq("POST", "/api/v1/users", map[string]interface{}{
+			"name": "Alice",
+		})
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("Expected 403 for non-tenant route in strict mode, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("Tenant route allowed", func(t *testing.T) {
+		resp, _ := doReq("POST", "/api/v1/tenant/acme/users", map[string]interface{}{
+			"name": "Alice",
+		})
+		if resp.StatusCode != http.StatusCreated {
+			t.Errorf("Expected 201 for tenant route, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("Health endpoint allowed", func(t *testing.T) {
+		resp, _ := doReq("GET", "/health", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Expected 200 for health endpoint, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("Version endpoint allowed", func(t *testing.T) {
+		resp, _ := doReq("GET", "/version", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Expected 200 for version endpoint, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("Graph routes allowed", func(t *testing.T) {
+		resp, _ := doReq("GET", "/api/v1/graph/stats", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Expected 200 for graph stats, got %d", resp.StatusCode)
 		}
 	})
 }

@@ -3,13 +3,18 @@ package graph
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"sync"
 
 	"github.com/ha1tch/olu/pkg/models"
 )
+
+// ErrCycleDetected is returned when adding an edge would create a cycle
+var ErrCycleDetected = errors.New("adding this edge would create a cycle")
 
 // Graph interface defines graph operations
 type Graph interface {
@@ -29,18 +34,42 @@ type Graph interface {
 
 // IndexedGraph implements an indexed graph with adjacency lists
 type IndexedGraph struct {
-	adjacency map[string]map[string]string // node -> {neighbor -> relationship}
-	reverse   map[string]map[string]string // reverse edges for incoming queries
-	index     map[string][]string          // type/property index
-	mu        sync.RWMutex
+	adjacency      map[string]map[string]string // node -> {neighbor -> relationship}
+	reverse        map[string]map[string]string // reverse edges for incoming queries
+	index          map[string][]string          // type/property index
+	cycleDetection string                       // "ignore", "warn", or "error"
+	mu             sync.RWMutex
 }
 
 // NewIndexedGraph creates a new indexed graph
 func NewIndexedGraph() *IndexedGraph {
 	return &IndexedGraph{
-		adjacency: make(map[string]map[string]string),
-		reverse:   make(map[string]map[string]string),
-		index:     make(map[string][]string),
+		adjacency:      make(map[string]map[string]string),
+		reverse:        make(map[string]map[string]string),
+		index:          make(map[string][]string),
+		cycleDetection: "ignore", // default: no cycle checking
+	}
+}
+
+// NewIndexedGraphWithCycleDetection creates a new indexed graph with cycle detection mode
+func NewIndexedGraphWithCycleDetection(mode string) *IndexedGraph {
+	if mode != "ignore" && mode != "warn" && mode != "error" {
+		mode = "ignore"
+	}
+	return &IndexedGraph{
+		adjacency:      make(map[string]map[string]string),
+		reverse:        make(map[string]map[string]string),
+		index:          make(map[string][]string),
+		cycleDetection: mode,
+	}
+}
+
+// SetCycleDetection sets the cycle detection mode
+func (g *IndexedGraph) SetCycleDetection(mode string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if mode == "ignore" || mode == "warn" || mode == "error" {
+		g.cycleDetection = mode
 	}
 }
 
@@ -48,17 +77,17 @@ func NewIndexedGraph() *IndexedGraph {
 func (g *IndexedGraph) AddNode(nodeID string, nodeType string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	
+
 	if _, exists := g.adjacency[nodeID]; !exists {
 		g.adjacency[nodeID] = make(map[string]string)
 		g.reverse[nodeID] = make(map[string]string)
 	}
-	
+
 	// Index by type
 	if nodeType != "" {
 		g.index[nodeType] = append(g.index[nodeType], nodeID)
 	}
-	
+
 	return nil
 }
 
@@ -66,23 +95,23 @@ func (g *IndexedGraph) AddNode(nodeID string, nodeType string) error {
 func (g *IndexedGraph) RemoveNode(nodeID string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	
+
 	// Remove outgoing edges
 	delete(g.adjacency, nodeID)
-	
+
 	// Remove incoming edges
 	delete(g.reverse, nodeID)
-	
+
 	// Remove from all neighbors' adjacency lists
 	for node := range g.adjacency {
 		delete(g.adjacency[node], nodeID)
 	}
-	
+
 	// Remove from all neighbors' reverse lists
 	for node := range g.reverse {
 		delete(g.reverse[node], nodeID)
 	}
-	
+
 	// Remove from index
 	for key, nodes := range g.index {
 		filtered := make([]string, 0)
@@ -97,7 +126,7 @@ func (g *IndexedGraph) RemoveNode(nodeID string) error {
 			delete(g.index, key)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -105,7 +134,7 @@ func (g *IndexedGraph) RemoveNode(nodeID string) error {
 func (g *IndexedGraph) AddEdge(from, to, relationship string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	
+
 	// Ensure nodes exist
 	if _, exists := g.adjacency[from]; !exists {
 		g.adjacency[from] = make(map[string]string)
@@ -115,29 +144,71 @@ func (g *IndexedGraph) AddEdge(from, to, relationship string) error {
 		g.adjacency[to] = make(map[string]string)
 		g.reverse[to] = make(map[string]string)
 	}
-	
+
+	// Add the edge
 	g.adjacency[from][to] = relationship
 	g.reverse[to][from] = relationship
-	
+
+	// Check for cycles if mode is not "ignore"
+	if g.cycleDetection != "ignore" {
+		if g.wouldCreateCycle(from, to) {
+			if g.cycleDetection == "error" {
+				// Remove the edge we just added
+				delete(g.adjacency[from], to)
+				delete(g.reverse[to], from)
+				return ErrCycleDetected
+			}
+			// mode == "warn"
+			log.Printf("[WARN] Cycle detected: edge %s -> %s creates a cycle", from, to)
+		}
+	}
+
 	// Index by relationship type
 	relKey := fmt.Sprintf("relationship:%s", relationship)
 	g.index[relKey] = append(g.index[relKey], from)
-	
+
 	return nil
+}
+
+// wouldCreateCycle checks if there's a path from 'to' back to 'from'
+// Must be called with lock held
+func (g *IndexedGraph) wouldCreateCycle(from, to string) bool {
+	// If there's a path from 'to' to 'from', adding edge from->to creates a cycle
+	visited := make(map[string]bool)
+	
+	var dfs func(node string) bool
+	dfs = func(node string) bool {
+		if node == from {
+			return true
+		}
+		if visited[node] {
+			return false
+		}
+		visited[node] = true
+		
+		for neighbor := range g.adjacency[node] {
+			if dfs(neighbor) {
+				return true
+			}
+		}
+		return false
+	}
+	
+	return dfs(to)
 }
 
 // RemoveEdge removes an edge between nodes
 func (g *IndexedGraph) RemoveEdge(from, to string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	
+
 	if adj, exists := g.adjacency[from]; exists {
 		delete(adj, to)
 	}
 	if rev, exists := g.reverse[to]; exists {
 		delete(rev, from)
 	}
-	
+
 	return nil
 }
 
@@ -145,18 +216,18 @@ func (g *IndexedGraph) RemoveEdge(from, to string) error {
 func (g *IndexedGraph) GetNeighbors(nodeID string) (map[string]string, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	
+
 	neighbors, exists := g.adjacency[nodeID]
 	if !exists {
 		return make(map[string]string), nil
 	}
-	
+
 	// Return a copy to avoid concurrent modification
 	result := make(map[string]string)
 	for k, v := range neighbors {
 		result[k] = v
 	}
-	
+
 	return result, nil
 }
 
@@ -164,18 +235,18 @@ func (g *IndexedGraph) GetNeighbors(nodeID string) (map[string]string, error) {
 func (g *IndexedGraph) GetIncomingEdges(nodeID string) (map[string]string, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	
+
 	incoming, exists := g.reverse[nodeID]
 	if !exists {
 		return make(map[string]string), nil
 	}
-	
+
 	// Return a copy
 	result := make(map[string]string)
 	for k, v := range incoming {
 		result[k] = v
 	}
-	
+
 	return result, nil
 }
 
@@ -183,32 +254,32 @@ func (g *IndexedGraph) GetIncomingEdges(nodeID string) (map[string]string, error
 func (g *IndexedGraph) FindPath(from, to string, maxDepth int) ([]string, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	
+
 	if _, exists := g.adjacency[from]; !exists {
 		return nil, fmt.Errorf("node %s not found", from)
 	}
 	if _, exists := g.adjacency[to]; !exists {
 		return nil, fmt.Errorf("node %s not found", to)
 	}
-	
+
 	queue := [][]string{{from}}
 	visited := make(map[string]bool)
 	visited[from] = true
-	
+
 	for len(queue) > 0 {
 		path := queue[0]
 		queue = queue[1:]
-		
+
 		if len(path) > maxDepth {
 			continue
 		}
-		
+
 		current := path[len(path)-1]
-		
+
 		if current == to {
 			return path, nil
 		}
-		
+
 		for neighbor := range g.adjacency[current] {
 			if !visited[neighbor] {
 				visited[neighbor] = true
@@ -219,7 +290,7 @@ func (g *IndexedGraph) FindPath(from, to string, maxDepth int) ([]string, error)
 			}
 		}
 	}
-	
+
 	return nil, fmt.Errorf("no path found")
 }
 
@@ -227,15 +298,15 @@ func (g *IndexedGraph) FindPath(from, to string, maxDepth int) ([]string, error)
 func (g *IndexedGraph) HasCycle() bool {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	
+
 	visited := make(map[string]bool)
 	recStack := make(map[string]bool)
-	
+
 	var hasCycleFrom func(string) bool
 	hasCycleFrom = func(node string) bool {
 		visited[node] = true
 		recStack[node] = true
-		
+
 		for neighbor := range g.adjacency[node] {
 			if !visited[neighbor] {
 				if hasCycleFrom(neighbor) {
@@ -245,11 +316,11 @@ func (g *IndexedGraph) HasCycle() bool {
 				return true
 			}
 		}
-		
+
 		recStack[node] = false
 		return false
 	}
-	
+
 	for node := range g.adjacency {
 		if !visited[node] {
 			if hasCycleFrom(node) {
@@ -257,81 +328,112 @@ func (g *IndexedGraph) HasCycle() bool {
 			}
 		}
 	}
-	
+
 	return false
 }
 
-// Save saves the graph to a file
+// graphData is the JSON-serializable representation of the graph
+type graphData struct {
+	Adjacency map[string]map[string]string `json:"adjacency"`
+	Reverse   map[string]map[string]string `json:"reverse"`
+	Index     map[string][]string          `json:"index"`
+}
+
+// Save saves the graph to a file in JSON format
 func (g *IndexedGraph) Save(filename string) error {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	
-	tempFile := filename + ".tmp"
-	file, err := os.Create(tempFile)
+
+	data := graphData{
+		Adjacency: g.adjacency,
+		Reverse:   g.reverse,
+		Index:     g.index,
+	}
+
+	jsonData, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-	
-	writer := bufio.NewWriter(file)
-	for nodeID, neighbors := range g.adjacency {
-		var parts []string
-		for neighbor, relType := range neighbors {
-			parts = append(parts, fmt.Sprintf("%s:%s", neighbor, relType))
-		}
-		line := fmt.Sprintf("%s:%s\n", nodeID, strings.Join(parts, " "))
-		if _, err := writer.WriteString(line); err != nil {
-			return err
-		}
-	}
-	
-	if err := writer.Flush(); err != nil {
+
+	tempFile := filename + ".tmp"
+	if err := os.WriteFile(tempFile, jsonData, 0644); err != nil {
 		return err
 	}
-	
+
 	return os.Rename(tempFile, filename)
 }
 
-// Load loads the graph from a file
+// Load loads the graph from a file in JSON format
 func (g *IndexedGraph) Load(filename string) error {
-	file, err := os.Open(filename)
+	jsonData, err := os.ReadFile(filename)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil // File doesn't exist yet, that's okay
 		}
 		return err
 	}
-	defer file.Close()
-	
+
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	
+
+	var data graphData
+	if err := json.Unmarshal(jsonData, &data); err != nil {
+		// Try legacy format for backward compatibility
+		return g.loadLegacy(filename)
+	}
+
+	g.adjacency = data.Adjacency
+	g.reverse = data.Reverse
+	g.index = data.Index
+
+	// Ensure maps are initialized even if empty in JSON
+	if g.adjacency == nil {
+		g.adjacency = make(map[string]map[string]string)
+	}
+	if g.reverse == nil {
+		g.reverse = make(map[string]map[string]string)
+	}
+	if g.index == nil {
+		g.index = make(map[string][]string)
+	}
+
+	return nil
+}
+
+// loadLegacy loads the old text-based format for backward compatibility
+func (g *IndexedGraph) loadLegacy(filename string) error {
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
 	g.adjacency = make(map[string]map[string]string)
 	g.reverse = make(map[string]map[string]string)
 	g.index = make(map[string][]string)
-	
+
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
-		
+
 		parts := strings.SplitN(line, ":", 2)
 		if len(parts) != 2 {
 			continue
 		}
-		
+
 		nodeID := parts[0]
 		if _, exists := g.adjacency[nodeID]; !exists {
 			g.adjacency[nodeID] = make(map[string]string)
 			g.reverse[nodeID] = make(map[string]string)
 		}
-		
+
 		if parts[1] == "" {
 			continue
 		}
-		
+
 		neighbors := strings.Split(parts[1], " ")
 		for _, neighbor := range neighbors {
 			if neighbor == "" {
@@ -341,18 +443,18 @@ func (g *IndexedGraph) Load(filename string) error {
 			if len(neighborParts) == 2 {
 				neighborID := neighborParts[0]
 				relType := neighborParts[1]
-				
+
 				if _, exists := g.adjacency[neighborID]; !exists {
 					g.adjacency[neighborID] = make(map[string]string)
 					g.reverse[neighborID] = make(map[string]string)
 				}
-				
+
 				g.adjacency[nodeID][neighborID] = relType
 				g.reverse[neighborID][nodeID] = relType
 			}
 		}
 	}
-	
+
 	return scanner.Err()
 }
 
@@ -360,33 +462,35 @@ func (g *IndexedGraph) Load(filename string) error {
 func (g *IndexedGraph) Clear() error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	
+
 	g.adjacency = make(map[string]map[string]string)
 	g.reverse = make(map[string]map[string]string)
 	g.index = make(map[string][]string)
-	
+
 	return nil
 }
 
 // SaveIndex saves the graph index to a file
+// Deprecated: Use Save() which now persists all graph data including index
 func (g *IndexedGraph) SaveIndex(filename string) error {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	
+
 	tempFile := filename + ".tmp"
 	data, err := json.MarshalIndent(g.index, "", "  ")
 	if err != nil {
 		return err
 	}
-	
+
 	if err := os.WriteFile(tempFile, data, 0644); err != nil {
 		return err
 	}
-	
+
 	return os.Rename(tempFile, filename)
 }
 
 // LoadIndex loads the graph index from a file
+// Deprecated: Use Load() which now loads all graph data including index
 func (g *IndexedGraph) LoadIndex(filename string) error {
 	data, err := os.ReadFile(filename)
 	if err != nil {
@@ -395,23 +499,23 @@ func (g *IndexedGraph) LoadIndex(filename string) error {
 		}
 		return err
 	}
-	
+
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	
+
 	return json.Unmarshal(data, &g.index)
 }
 
 // UpdateFromEntity updates the graph based on entity data
 func (g *IndexedGraph) UpdateFromEntity(entity string, id int, data map[string]interface{}) error {
 	nodeID := fmt.Sprintf("%s:%d", entity, id)
-	
+
 	// Add node
 	nodeType, _ := data["type"].(string)
 	if err := g.AddNode(nodeID, nodeType); err != nil {
 		return err
 	}
-	
+
 	// Process references
 	for key, value := range data {
 		if ref, isRef := models.IsReference(value); isRef {
@@ -421,7 +525,7 @@ func (g *IndexedGraph) UpdateFromEntity(entity string, id int, data map[string]i
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -436,10 +540,218 @@ func (g *IndexedGraph) NodeCount() int {
 func (g *IndexedGraph) EdgeCount() int {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	
+
 	count := 0
 	for _, neighbors := range g.adjacency {
 		count += len(neighbors)
 	}
 	return count
+}
+
+// Degree contains in/out degree counts for a node
+type Degree struct {
+	In    int `json:"in"`
+	Out   int `json:"out"`
+	Total int `json:"total"`
+}
+
+// GetDegree returns the in-degree, out-degree, and total degree of a node
+func (g *IndexedGraph) GetDegree(nodeID string) (Degree, error) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	if _, exists := g.adjacency[nodeID]; !exists {
+		return Degree{}, fmt.Errorf("node %s not found", nodeID)
+	}
+
+	outDegree := len(g.adjacency[nodeID])
+	inDegree := len(g.reverse[nodeID])
+
+	return Degree{
+		In:    inDegree,
+		Out:   outDegree,
+		Total: inDegree + outDegree,
+	}, nil
+}
+
+// PathExists checks if a path exists between two nodes within maxDepth
+func (g *IndexedGraph) PathExists(from, to string, maxDepth int) (bool, int, error) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	if _, exists := g.adjacency[from]; !exists {
+		return false, 0, fmt.Errorf("node %s not found", from)
+	}
+	if _, exists := g.adjacency[to]; !exists {
+		return false, 0, fmt.Errorf("node %s not found", to)
+	}
+
+	if from == to {
+		return true, 0, nil
+	}
+
+	// BFS to find shortest path length
+	queue := []struct {
+		node  string
+		depth int
+	}{{from, 0}}
+	visited := make(map[string]bool)
+	visited[from] = true
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		if current.depth >= maxDepth {
+			continue
+		}
+
+		for neighbor := range g.adjacency[current.node] {
+			if neighbor == to {
+				return true, current.depth + 1, nil
+			}
+			if !visited[neighbor] {
+				visited[neighbor] = true
+				queue = append(queue, struct {
+					node  string
+					depth int
+				}{neighbor, current.depth + 1})
+			}
+		}
+	}
+
+	return false, 0, nil
+}
+
+// CommonNeighbors finds nodes that are neighbors of both nodeA and nodeB
+func (g *IndexedGraph) CommonNeighbors(nodeA, nodeB string) ([]string, error) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	if _, exists := g.adjacency[nodeA]; !exists {
+		return nil, fmt.Errorf("node %s not found", nodeA)
+	}
+	if _, exists := g.adjacency[nodeB]; !exists {
+		return nil, fmt.Errorf("node %s not found", nodeB)
+	}
+
+	// Get all neighbors (both directions) for each node
+	neighborsA := make(map[string]bool)
+	for n := range g.adjacency[nodeA] {
+		neighborsA[n] = true
+	}
+	for n := range g.reverse[nodeA] {
+		neighborsA[n] = true
+	}
+
+	// Find intersection with nodeB's neighbors
+	var common []string
+	for n := range g.adjacency[nodeB] {
+		if neighborsA[n] {
+			common = append(common, n)
+		}
+	}
+	for n := range g.reverse[nodeB] {
+		if neighborsA[n] && !contains(common, n) {
+			common = append(common, n)
+		}
+	}
+
+	return common, nil
+}
+
+// GetNodesByType returns all nodes of a given entity type
+func (g *IndexedGraph) GetNodesByType(entityType string) []string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	var result []string
+	prefix := entityType + ":"
+	for nodeID := range g.adjacency {
+		if strings.HasPrefix(nodeID, prefix) {
+			result = append(result, nodeID)
+		}
+	}
+	return result
+}
+
+// GetAllNodes returns all node IDs in the graph
+func (g *IndexedGraph) GetAllNodes() []string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	result := make([]string, 0, len(g.adjacency))
+	for nodeID := range g.adjacency {
+		result = append(result, nodeID)
+	}
+	return result
+}
+
+// NodeExists checks if a node exists in the graph
+func (g *IndexedGraph) NodeExists(nodeID string) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	_, exists := g.adjacency[nodeID]
+	return exists
+}
+
+// GetNodeInfo returns comprehensive info about a node
+type NodeInfo struct {
+	ID       string            `json:"id"`
+	Entity   string            `json:"entity"`
+	EntityID int               `json:"entity_id"`
+	Outgoing map[string]string `json:"outgoing"` // neighbor -> relationship
+	Incoming map[string]string `json:"incoming"` // neighbor -> relationship
+	Degree   Degree            `json:"degree"`
+}
+
+func (g *IndexedGraph) GetNodeInfo(nodeID string) (*NodeInfo, error) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	if _, exists := g.adjacency[nodeID]; !exists {
+		return nil, fmt.Errorf("node %s not found", nodeID)
+	}
+
+	// Parse entity:id format
+	parts := strings.SplitN(nodeID, ":", 2)
+	entity := ""
+	entityID := 0
+	if len(parts) == 2 {
+		entity = parts[0]
+		fmt.Sscanf(parts[1], "%d", &entityID)
+	}
+
+	// Copy maps
+	outgoing := make(map[string]string)
+	for k, v := range g.adjacency[nodeID] {
+		outgoing[k] = v
+	}
+	incoming := make(map[string]string)
+	for k, v := range g.reverse[nodeID] {
+		incoming[k] = v
+	}
+
+	return &NodeInfo{
+		ID:       nodeID,
+		Entity:   entity,
+		EntityID: entityID,
+		Outgoing: outgoing,
+		Incoming: incoming,
+		Degree: Degree{
+			In:    len(incoming),
+			Out:   len(outgoing),
+			Total: len(incoming) + len(outgoing),
+		},
+	}, nil
+}
+
+// helper function
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
 }

@@ -12,7 +12,14 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2/expirable"
 )
 
-// Cache interface defines caching operations
+// Cache interface defines caching operations.
+//
+// Two implementations are provided:
+//   - MemoryCache: Simple in-process LRU cache with global TTL
+//   - RedisCache: Distributed cache with per-item TTL support
+//
+// Use MemoryCache for development and single-instance deployments.
+// Use RedisCache for horizontal scaling or when per-item TTL is needed.
 type Cache interface {
 	Get(ctx context.Context, key string) (interface{}, error)
 	Set(ctx context.Context, key string, value interface{}, ttl time.Duration) error
@@ -22,7 +29,9 @@ type Cache interface {
 	Close() error
 }
 
-// MemoryCache implements an in-memory LRU cache with TTL
+// MemoryCache implements an in-memory LRU cache.
+// TTL is global, set at construction time via NewMemoryCache.
+// For per-item TTL, use RedisCache instead.
 type MemoryCache struct {
 	cache *lru.LRU[string, interface{}]
 	mu    sync.RWMutex
@@ -47,7 +56,9 @@ func (m *MemoryCache) Get(ctx context.Context, key string) (interface{}, error) 
 	return val, nil
 }
 
-// Set stores a value in the cache
+// Set stores a value in the cache.
+// Note: ttl parameter is ignored; global TTL from NewMemoryCache is used.
+// For per-item TTL, use RedisCache.
 func (m *MemoryCache) Set(ctx context.Context, key string, value interface{}, ttl time.Duration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

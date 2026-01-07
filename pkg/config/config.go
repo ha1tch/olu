@@ -6,8 +6,6 @@ import (
 	"strings"
 )
 
-const Version = "0.7.0"
-
 // Config holds application configuration
 type Config struct {
 	// Server configuration
@@ -22,34 +20,34 @@ type Config struct {
 	DBPath      string // SQLite database path
 
 	// Cache configuration
-	CacheType      string // "memory" or "redis"
-	CacheTTL       int    // seconds
-	RedisHost      string
-	RedisPort      int
-	CacheSize      int
+	CacheType string // "memory" or "redis"
+	CacheTTL  int    // seconds
+	RedisHost string
+	RedisPort int
+	CacheSize int
 
 	// Graph configuration
-	GraphEnabled       bool
-	GraphMode          string // "indexed" or "disabled"
-	GraphDataFile      string
-	GraphIndexFile     string
-	GraphQueryTTL      int
-	GraphResultTTL     int
+	GraphEnabled        bool
+	GraphMode           string // "indexed" or "disabled"
+	GraphDataFile       string
+	GraphIndexFile      string
+	GraphQueryTTL       int
+	GraphResultTTL      int
 	GraphCycleDetection string // "warn", "error", "ignore"
 
 	// Full-text search
 	FullTextEnabled bool
 
 	// Query configuration
-	MaxQueryDepth     int
-	MaxEmbedDepth     int
-	RefEmbedDepth     int
-	DefaultPageSize   int
+	MaxQueryDepth   int
+	MaxEmbedDepth   int
+	RefEmbedDepth   int
+	DefaultPageSize int
 
 	// Entity configuration
 	PatchNullBehavior string // "store" or "delete"
 	MaxEntitySize     int    // bytes
-	
+
 	// Cascade delete configuration
 	CascadingDelete     bool
 	MaxCascadeDeletions int
@@ -58,6 +56,30 @@ type Config struct {
 	// Debug
 	Debug      bool
 	DebugLocks bool
+
+	// Authentication
+	AuthType         string   // "none", "jwt", "apikey"
+	JWTSecret        string   // Secret for JWT validation
+	JWTIssuer        string   // Expected issuer claim
+	APIKeys          []string // Valid API keys (comma-separated in env)
+	AuthExcludePaths []string // Paths excluded from auth (e.g., /health)
+
+	// Rate limiting
+	RateLimitEnabled bool
+	RateLimitRate    int // Requests per window
+	RateLimitWindow  int // Window in seconds
+	RateLimitByIP    bool
+	RateLimitByKey   bool // Rate limit by API key or JWT subject
+
+	// Metrics
+	MetricsEnabled bool
+
+	// Multi-tenancy
+	// TenantMode controls tenant isolation behaviour:
+	//   "none"   - No tenant features (default)
+	//   "path"   - Tenant routes available, non-tenant routes also work
+	//   "strict" - All entity requests require tenant context; non-tenant routes return 403
+	TenantMode string
 }
 
 // Default returns the default configuration
@@ -94,6 +116,18 @@ func Default() *Config {
 		MaxCascadeWork:      100000,
 		Debug:               false,
 		DebugLocks:          false,
+		AuthType:            "none",
+		JWTSecret:           "",
+		JWTIssuer:           "",
+		APIKeys:             []string{},
+		AuthExcludePaths:    []string{"/health", "/version", "/metrics"},
+		RateLimitEnabled:    false,
+		RateLimitRate:       100,
+		RateLimitWindow:     60,
+		RateLimitByIP:       true,
+		RateLimitByKey:      false,
+		MetricsEnabled:      true,
+		TenantMode:          "none",
 	}
 }
 
@@ -169,6 +203,52 @@ func LoadFromEnv(cfg *Config) {
 	}
 	if val := os.Getenv("PATCH_NULL"); val != "" {
 		cfg.PatchNullBehavior = val
+	}
+
+	// Authentication settings
+	if val := os.Getenv("AUTH_TYPE"); val != "" {
+		cfg.AuthType = val
+	}
+	if val := os.Getenv("JWT_SECRET"); val != "" {
+		cfg.JWTSecret = val
+	}
+	if val := os.Getenv("JWT_ISSUER"); val != "" {
+		cfg.JWTIssuer = val
+	}
+	if val := os.Getenv("API_KEYS"); val != "" {
+		cfg.APIKeys = strings.Split(val, ",")
+		for i := range cfg.APIKeys {
+			cfg.APIKeys[i] = strings.TrimSpace(cfg.APIKeys[i])
+		}
+	}
+
+	// Rate limiting settings
+	if val := os.Getenv("RATE_LIMIT_ENABLED"); val != "" {
+		cfg.RateLimitEnabled = parseBool(val)
+	}
+	if val := os.Getenv("RATE_LIMIT_RATE"); val != "" {
+		if rate, err := strconv.Atoi(val); err == nil {
+			cfg.RateLimitRate = rate
+		}
+	}
+	if val := os.Getenv("RATE_LIMIT_WINDOW"); val != "" {
+		if window, err := strconv.Atoi(val); err == nil {
+			cfg.RateLimitWindow = window
+		}
+	}
+	if val := os.Getenv("RATE_LIMIT_BY_IP"); val != "" {
+		cfg.RateLimitByIP = parseBool(val)
+	}
+	if val := os.Getenv("RATE_LIMIT_BY_KEY"); val != "" {
+		cfg.RateLimitByKey = parseBool(val)
+	}
+	if val := os.Getenv("METRICS_ENABLED"); val != "" {
+		cfg.MetricsEnabled = parseBool(val)
+	}
+
+	// Tenant mode
+	if val := os.Getenv("TENANT_MODE"); val != "" {
+		cfg.TenantMode = val
 	}
 }
 

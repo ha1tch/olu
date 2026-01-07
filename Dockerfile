@@ -1,20 +1,26 @@
 # Build stage
-FROM golang:1.21-alpine AS builder
+FROM golang:1.22-alpine AS builder
 
-# Install build dependencies
-RUN apk add --no-cache git make
+# Install build dependencies (gcc needed for SQLite/CGO)
+RUN apk add --no-cache git make gcc musl-dev
+
+# Skip checksum verification and allow module updates during build
+# This ensures consistent behaviour across Go versions
+ENV GONOSUMDB=*
+ENV GOPRIVATE=github.com/ha1tch/*
+ENV GOFLAGS=-mod=mod
 
 WORKDIR /build
 
-# Copy go mod files
-COPY go.mod go.sum ./
+# Copy go mod file (go.sum optional - will be generated)
+COPY go.mod ./
 RUN go mod download
 
 # Copy source code
 COPY . .
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o olu ./cmd/olu
+# Build the application with CGO enabled for SQLite support
+RUN CGO_ENABLED=1 GOOS=linux go build -a -o olu ./cmd/olu
 
 # Final stage
 FROM alpine:latest
