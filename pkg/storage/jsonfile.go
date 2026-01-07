@@ -12,11 +12,10 @@ import (
 
 // JSONFileStore implements Store interface using JSON files
 type JSONFileStore struct {
-	baseDir   string
-	schema    string
-	idLocks   map[string]*sync.Mutex
-	idMutex   sync.RWMutex
-	entityMux sync.RWMutex
+	baseDir string
+	schema  string
+	idLocks map[string]*sync.Mutex
+	idMutex sync.RWMutex
 }
 
 // NewJSONFileStore creates a new JSON file-based storage

@@ -1112,7 +1112,7 @@ func (s *Server) invalidateCache(entity string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	s.cache.DeletePattern(ctx, entity)
+	_ = s.cache.DeletePattern(ctx, entity)
 }
 
 // handleFullTextSearch performs full-text search across entities
@@ -1230,7 +1230,7 @@ func (s *Server) cascadeDelete(ctx context.Context, entity string, id int) ([]st
 		// Remove from graph
 		if s.config.GraphEnabled {
 			nodeID := fmt.Sprintf("%s:%d", current.entity, current.id)
-			s.graph.RemoveNode(nodeID)
+			_ = s.graph.RemoveNode(nodeID)
 		}
 	}
 
@@ -1332,7 +1332,7 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	manifestBytes, _ := json.MarshalIndent(manifest, "", "  ")
 	mw, err := zw.Create("manifest.json")
 	if err == nil {
-		mw.Write(manifestBytes)
+		_, _ = mw.Write(manifestBytes)
 	}
 
 	s.logger.Info().Str("filename", filename).Msg("Export completed")

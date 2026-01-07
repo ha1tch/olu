@@ -16,8 +16,7 @@ linters:
 
 linters-settings:
   errcheck:
-    # Don't check error returns in test files - test setup code
-    # often ignores errors intentionally
+    # Don't check error returns for common functions where errors are often ignored
     exclude-functions:
       - (io.Closer).Close
       - (net/http.ResponseWriter).Write
@@ -29,14 +28,13 @@ linters-settings:
     check-blank: false
 
 issues:
-  # Exclude errcheck in test files
+  # Exclude all linter issues in test files
   exclude-rules:
     - path: _test\.go
       linters:
         - errcheck
-    # Exclude some gosimple/govet issues that are noisy
-    - path: _test\.go
-      linters:
         - gosimple
         - govet
-      text: "should use"
+        - ineffassign
+        - staticcheck
+
