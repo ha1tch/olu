@@ -37,4 +37,8 @@ issues:
         - govet
         - ineffassign
         - staticcheck
+    # S1034 is noisy for type switches - exclude it everywhere
+    - linters:
+        - gosimple
+      text: "S1034"
 
