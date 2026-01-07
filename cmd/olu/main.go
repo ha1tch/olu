@@ -197,7 +197,7 @@ func printBanner(cfg *config.Config, logger zerolog.Logger) {
 	fmt.Print(reset)
 
 	fmt.Println()
-	fmt.Println("/////////////////// " + version.Version + " ////////////////////")
+	fmt.Println("////////////////// olu " + version.Version + " /////////////////")
 	fmt.Println("----------------------------------------------")
 	fmt.Println("Server Configuration:")
 	fmt.Printf("  Host: %s\n", cfg.Host)

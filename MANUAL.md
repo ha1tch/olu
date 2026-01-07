@@ -681,27 +681,193 @@ make stress-race    # With race detector
 
 ## Deployment
 
-### Docker Compose
+### Docker Compose Profiles
+
+Olu ships with a multi-profile `docker-compose.yml` for different scenarios:
+
+```bash
+# Basic: memory cache, no auth
+docker compose up
+
+# With Redis cache
+docker compose --profile redis up
+
+# Full features: Redis, SQLite+FTS, auth, rate limiting, metrics
+docker compose --profile full up
+
+# Run integration tests
+docker compose --profile test up
+```
+
+Or use the Makefile shortcuts:
+
+```bash
+make docker-up          # Basic
+make docker-up-redis    # With Redis
+make docker-up-full     # All features
+make docker-test        # Integration tests
+make docker-down        # Stop all
+make docker-clean       # Stop and remove volumes
+```
+
+### Building the Docker Image
+
+```bash
+make docker-build
+```
+
+This builds `olu:latest` using Go 1.22 with CGO enabled for SQLite support.
+
+### Development Configuration
+
+For local development with minimal setup:
 
 ```yaml
-version: '3.8'
 services:
   olu:
-    image: ghcr.io/ha1tch/olu:latest
+    build: .
     ports:
       - "9090:9090"
     environment:
+      - STORAGE_TYPE=jsonfile
+      - CACHE_TYPE=memory
+      - AUTH_TYPE=none
+      - RSERV_GRAPH=indexed
+    volumes:
+      - ./data:/app/data
+      - ./schema:/app/schema
+```
+
+### Production Configuration
+
+For production with all security and performance features:
+
+```yaml
+services:
+  olu:
+    image: olu:latest
+    ports:
+      - "9090:9090"
+    environment:
+      # Storage
       - STORAGE_TYPE=sqlite
-      - DB_PATH=/data/olu.db
+      - DB_PATH=/app/data/olu.db
+      - FULLTEXT_ENABLED=true
+      # Cache
+      - CACHE_TYPE=redis
+      - CACHE_TTL=300
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      # Graph
+      - RSERV_GRAPH=indexed
+      - GRAPH_CYCLE_DETECTION=error
+      # Authentication
       - AUTH_TYPE=apikey
       - API_KEYS=${API_KEYS}
+      # Rate limiting
       - RATE_LIMIT_ENABLED=true
+      - RATE_LIMIT_RATE=100
+      - RATE_LIMIT_WINDOW=60
+      - RATE_LIMIT_BY_KEY=true
+      # Metrics
+      - METRICS_ENABLED=true
+      # Multi-tenancy (optional)
+      - TENANT_MODE=path
     volumes:
-      - olu-data:/data
+      - olu-data:/app/data
+      - ./schema:/app/schema
+    depends_on:
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
     restart: unless-stopped
 
 volumes:
   olu-data:
+  redis-data:
+```
+
+### Testing with Containers
+
+#### Unit Tests with Redis
+
+```bash
+# Run Redis cache tests (starts/stops Redis automatically)
+make test-redis
+
+# Run Redis stress tests (concurrent access, large payloads)
+make test-redis-stress
+```
+
+#### Integration Tests
+
+The `make docker-test` target runs a comprehensive integration test suite:
+
+```bash
+make docker-test
+```
+
+Tests include:
+- Health, version, and Prometheus metrics endpoints
+- Authentication (API key validation)
+- Entity CRUD operations
+- Full-text search (SQLite FTS)
+- Graph operations
+- Multi-tenancy (tenant-scoped routes)
+- Rate limiting (verifies 429 responses)
+
+Expected output:
+```
+========================================
+Running Olu Integration Tests
+========================================
+
+--- Health & System Endpoints ---
+✓ Health check (200)
+✓ Version (200)
+✓ Metrics (Prometheus) (200)
+
+--- Authentication ---
+✓ No auth rejected (401)
+✓ Bad API key rejected (401)
+✓ Valid API key accepted (200)
+
+--- Entity CRUD ---
+✓ Create entity (201)
+✓ Get entity (200)
+✓ List entities (200)
+✓ Update entity (200)
+✓ Patch entity (200)
+
+--- Full-Text Search (SQLite FTS) ---
+✓ FTS search (200)
+
+--- Graph Operations ---
+✓ Graph stats (200)
+
+--- Multi-Tenancy ---
+✓ Tenant create (201)
+✓ Tenant list (200)
+
+--- Cleanup ---
+✓ Delete entity (200)
+
+--- Rate Limiting ---
+✓ Rate limiting triggered (429)
+
+========================================
+Results: 17 passed, 0 failed
+========================================
 ```
 
 ### Reverse Proxy (nginx)
@@ -733,24 +899,60 @@ server {
 # Simple health check
 curl -f http://localhost:9090/health
 
-# Kubernetes liveness probe
+# Version info
+curl http://localhost:9090/version
+
+# Prometheus metrics
+curl http://localhost:9090/metrics
+```
+
+Kubernetes probes:
+
+```yaml
 livenessProbe:
   httpGet:
     path: /health
     port: 9090
   initialDelaySeconds: 5
   periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 9090
+  initialDelaySeconds: 3
+  periodSeconds: 5
 ```
 
-### Backup
+### Backup and Restore
+
+#### SQLite Backup
 
 ```bash
-# SQLite
-sqlite3 olu.db ".backup backup.db"
+# Using sqlite3
+sqlite3 /app/data/olu.db ".backup /backup/olu-$(date +%Y%m%d).db"
 
-# Or use export endpoint
-curl http://localhost:9090/api/v1/export > backup.zip
+# Using export endpoint (includes graph data)
+curl http://localhost:9090/api/v1/export > backup-$(date +%Y%m%d).zip
 ```
+
+#### Scheduled Backup (cron)
+
+```bash
+0 2 * * * docker exec olu sqlite3 /app/data/olu.db ".backup /backup/olu-daily.db"
+```
+
+### Scaling Considerations
+
+**Single instance (recommended for most use cases):**
+- Memory cache is sufficient
+- SQLite handles thousands of requests/second
+- Simpler operations
+
+**Multiple instances:**
+- Use Redis cache for shared state
+- Each instance needs access to same SQLite file (not recommended) or use separate databases with external coordination
+- Consider whether you actually need horizontal scaling — olu handles significant load on a single instance
 
 ---
 
