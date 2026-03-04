@@ -1,6 +1,11 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package sulpher
 
 import (
+	"context"
 	"testing"
 
 	"github.com/ha1tch/olu/pkg/graph"
@@ -48,7 +53,7 @@ func TestExecuteSimpleMatch(t *testing.T) {
 		t.Fatalf("Parse failed: %v", err)
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -68,7 +73,7 @@ func TestExecuteWithRelationship(t *testing.T) {
 		t.Fatalf("Parse failed: %v", err)
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -91,7 +96,7 @@ func TestExecuteWithInlineProperty(t *testing.T) {
 		t.Fatalf("Parse failed: %v", err)
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -112,7 +117,7 @@ func TestExecuteVariableLengthPath(t *testing.T) {
 		t.Fatalf("Parse failed: %v", err)
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -139,7 +144,7 @@ func TestExecuteBFS(t *testing.T) {
 		t.Errorf("Expected BFS algorithm (default)")
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -164,7 +169,7 @@ func TestExecuteDFS(t *testing.T) {
 		t.Errorf("Expected DFS algorithm")
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -185,7 +190,7 @@ func TestExecuteWithWhereCondition(t *testing.T) {
 		t.Fatalf("Parse failed: %v", err)
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -206,7 +211,7 @@ func TestExecuteWithOrConditions(t *testing.T) {
 		t.Fatalf("Parse failed: %v", err)
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -231,7 +236,7 @@ func TestExecuteDistinct(t *testing.T) {
 		t.Error("Expected Distinct=true")
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -264,7 +269,7 @@ func TestExecuteLimit(t *testing.T) {
 		t.Errorf("Expected Limit=2, got %d", query.Limit)
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -291,7 +296,7 @@ func TestExecuteOrderBy(t *testing.T) {
 		t.Error("Expected DESC order")
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -324,7 +329,7 @@ func TestExecuteCombined(t *testing.T) {
 		t.Error("Expected ORDER BY")
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -345,7 +350,7 @@ func TestExecuteIncoming(t *testing.T) {
 		t.Fatalf("Parse failed: %v", err)
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -367,7 +372,7 @@ func TestExecuteBidirectional(t *testing.T) {
 		t.Fatalf("Parse failed: %v", err)
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -389,7 +394,7 @@ func TestExecuteMultiHop(t *testing.T) {
 		t.Fatalf("Parse failed: %v", err)
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -411,7 +416,7 @@ func TestExecuteNoResults(t *testing.T) {
 		t.Fatalf("Parse failed: %v", err)
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -435,7 +440,7 @@ func TestExecuteReturnMultipleVariables(t *testing.T) {
 		t.Errorf("Expected 2 return items, got %d", len(query.ReturnItems))
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -465,7 +470,7 @@ func TestExecuteReturnProperty(t *testing.T) {
 		t.Error("Expected return of u.id property")
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -486,7 +491,7 @@ func TestExecuteStats(t *testing.T) {
 		t.Fatalf("Parse failed: %v", err)
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -509,7 +514,7 @@ func TestExecuteEmptyGraph(t *testing.T) {
 		t.Fatalf("Parse failed: %v", err)
 	}
 
-	result, err := executor.Execute(query)
+	result, err := executor.Execute(context.Background(), query)
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}

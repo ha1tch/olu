@@ -39,10 +39,10 @@ RUN mkdir -p data schema
 EXPOSE 9090
 
 # Set environment variables
-ENV HOST=0.0.0.0
-ENV PORT=9090
-ENV BASE_DIR=/app/data
-ENV SCHEMA_DIR=/app/schema
+ENV OLU_HOST=0.0.0.0
+ENV OLU_PORT=9090
+ENV OLU_BASE_DIR=/app/data
+ENV OLU_SCHEMA_DIR=/app/schema
 
 # Run the application
 CMD ["./olu"]

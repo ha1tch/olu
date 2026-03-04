@@ -1,6 +1,11 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package sulpher
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -32,26 +37,40 @@ type Job struct {
 
 // JobManager manages async query jobs
 type JobManager struct {
-	jobs     map[string]*Job
-	executor *Executor
-	parser   *Parser
-	mu       sync.RWMutex
-	ttl      time.Duration
+	jobs         map[string]*Job
+	executor     *Executor
+	parser       *Parser
+	mu           sync.RWMutex
+	ttl          time.Duration
+	queryTimeout time.Duration
 }
 
 // NewJobManager creates a new job manager
 func NewJobManager(executor *Executor, ttl time.Duration) *JobManager {
 	jm := &JobManager{
-		jobs:     make(map[string]*Job),
-		executor: executor,
-		parser:   NewParser(),
-		ttl:      ttl,
+		jobs:         make(map[string]*Job),
+		executor:     executor,
+		parser:       NewParser(),
+		ttl:          ttl,
+		queryTimeout: 5 * time.Minute, // default; override via SetQueryTimeout
 	}
 
 	// Start cleanup goroutine
 	go jm.cleanupLoop()
 
 	return jm
+}
+
+// SetQueryTimeout sets the maximum execution time for async graph queries.
+func (jm *JobManager) SetQueryTimeout(d time.Duration) {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+	jm.queryTimeout = d
+}
+
+// SetLimits configures graph query execution limits on the underlying executor.
+func (jm *JobManager) SetLimits(limits GraphLimits) {
+	jm.executor.SetLimits(limits)
 }
 
 // Submit submits a new query job and returns immediately
@@ -81,7 +100,7 @@ func (jm *JobManager) Submit(queryStr string, maxDepth int) (*Job, error) {
 }
 
 // ExecuteSync executes a query synchronously
-func (jm *JobManager) ExecuteSync(queryStr string, maxDepth int) (*QueryResult, error) {
+func (jm *JobManager) ExecuteSync(ctx context.Context, queryStr string, maxDepth int) (*QueryResult, error) {
 	query, err := jm.parser.Parse(queryStr)
 	if err != nil {
 		return nil, err
@@ -96,7 +115,7 @@ func (jm *JobManager) ExecuteSync(queryStr string, maxDepth int) (*QueryResult, 
 		jm.executor.maxDepth = originalMaxDepth
 	}()
 
-	return jm.executor.Execute(query)
+	return jm.executor.Execute(ctx, query)
 }
 
 // GetJob retrieves a job by ID
@@ -145,7 +164,10 @@ func (jm *JobManager) executeJob(job *Job) {
 		jm.executor.maxDepth = job.MaxDepth
 	}
 
-	result, err := jm.executor.Execute(query)
+	ctx, cancel := context.WithTimeout(context.Background(), jm.queryTimeout)
+	defer cancel()
+
+	result, err := jm.executor.Execute(ctx, query)
 
 	jm.executor.maxDepth = originalMaxDepth
 

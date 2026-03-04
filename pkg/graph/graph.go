@@ -1,3 +1,7 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package graph
 
 import (
@@ -516,13 +520,39 @@ func (g *IndexedGraph) UpdateFromEntity(entity string, id int, data map[string]i
 		return err
 	}
 
-	// Process references
+	// Collect the set of targets derived from current REFs
+	newEdges := make(map[string]string) // target -> relationship
 	for key, value := range data {
 		if ref, isRef := models.IsReference(value); isRef {
 			targetNodeID := fmt.Sprintf("%s:%d", ref.Entity, ref.ID)
-			if err := g.AddEdge(nodeID, targetNodeID, key); err != nil {
+			newEdges[targetNodeID] = key
+		}
+	}
+
+	// Remove outgoing edges that are no longer present in the entity data.
+	// We read the current outgoing edges, then remove any that don't appear
+	// in the new set. This prevents stale edges from accumulating.
+	g.mu.RLock()
+	oldTargets := make(map[string]string)
+	if adj, exists := g.adjacency[nodeID]; exists {
+		for target, rel := range adj {
+			oldTargets[target] = rel
+		}
+	}
+	g.mu.RUnlock()
+
+	for oldTarget := range oldTargets {
+		if _, stillExists := newEdges[oldTarget]; !stillExists {
+			if err := g.RemoveEdge(nodeID, oldTarget); err != nil {
 				return err
 			}
+		}
+	}
+
+	// Add/update current edges
+	for targetNodeID, relationship := range newEdges {
+		if err := g.AddEdge(nodeID, targetNodeID, relationship); err != nil {
+			return err
 		}
 	}
 

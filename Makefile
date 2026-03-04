@@ -28,6 +28,23 @@ run: build
 	@./${BINARY_NAME}
 
 # Clean build artifacts
+
+# =============================================================================
+# Release
+# =============================================================================
+
+# Full release: runs tests once, generates TESTING.md, updates badges, cuts zip
+# Usage: make release VERSION=0.9.4
+#        make release VERSION=0.9.5-rc1 RELEASE_FLAGS=--short
+release:
+	@if [ -z "$(VERSION)" ]; then echo "Usage: make release VERSION=<version>" >&2; exit 1; fi
+	@./release.sh $(VERSION) $(RELEASE_FLAGS)
+
+# Dry run: everything except the zip
+release-dry:
+	@if [ -z "$(VERSION)" ]; then echo "Usage: make release-dry VERSION=<version>" >&2; exit 1; fi
+	@./release.sh $(VERSION) --no-zip $(RELEASE_FLAGS)
+
 clean:
 	@echo "Cleaning..."
 	@go clean -testcache
@@ -59,10 +76,21 @@ test-race:
 
 # Run tests with coverage
 coverage:
-	@echo "Running tests with coverage..."
-	@go test -short -coverprofile=coverage.out ./...
-	@go tool cover -html=coverage.out -o coverage.html
-	@echo "Coverage report generated: coverage.html"
+	@./run_tests.sh
+
+# Run tests with coverage including Redis
+coverage-redis:
+	@./run_tests.sh --redis
+
+# Coverage with HTML report
+coverage-html:
+	@./run_tests.sh --html
+
+# Coverage gate — fails if aggregate drops below threshold
+# Usage: make coverage-check THRESHOLD=75
+THRESHOLD ?= 75
+coverage-check:
+	@./run_tests.sh --threshold $(THRESHOLD)
 
 # Quick test (no verbose, cached results ok)
 test-quick:
@@ -228,7 +256,7 @@ pre-commit: clean build test test-race
 	@echo "✓ All pre-commit checks passed!"
 
 # CI pipeline simulation
-ci: clean deps build test-race bench
+ci: clean deps build test-race coverage bench
 	@echo "✓ CI pipeline passed!"
 
 # =============================================================================
@@ -337,6 +365,9 @@ help:
 	@echo "  test-quick      - Quick test run (cached results)"
 	@echo "  test-full       - Full test suite (tests + stress + race)"
 	@echo "  coverage        - Run tests with coverage report"
+	@echo "  coverage-redis  - Coverage including Redis backend"
+	@echo "  coverage-html   - Coverage with HTML report"
+	@echo "  coverage-check  - Fail if coverage below threshold (THRESHOLD=75)"
 	@echo "  test-report     - Generate JSON test report"
 	@echo ""
 	@echo "Package Tests:"

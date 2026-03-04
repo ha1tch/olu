@@ -1,3 +1,7 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package server_test
 
 import (
@@ -8,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"context"
 	"testing"
 	"time"
 
@@ -56,6 +61,8 @@ func setupTestServer(t *testing.T) *TestServer {
 		GraphDataFile:      filepath.Join(tmpDir, "graph.data"),
 		GraphIndexFile:     filepath.Join(tmpDir, "graph.index"),
 		MaxCascadeDeletions: 100,
+		TenantMode:          "path",
+		TenantAutoRegister:  true, // Tests rely on auto-registration
 	}
 
 	// Initialize components
@@ -148,6 +155,22 @@ func TestHealthEndpoints(t *testing.T) {
 		}
 	})
 
+	t.Run("GET /ready", func(t *testing.T) {
+		resp, body := ts.doRequest("GET", "/ready", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Expected 200, got %d", resp.StatusCode)
+		}
+
+		var result map[string]interface{}
+		if err := json.Unmarshal(body, &result); err != nil {
+			t.Fatal(err)
+		}
+
+		if result["status"] != "ready" {
+			t.Errorf("Expected status ready, got %v", result["status"])
+		}
+	})
+
 	t.Run("GET /version", func(t *testing.T) {
 		resp, body := ts.doRequest("GET", "/version", nil)
 		if resp.StatusCode != http.StatusOK {
@@ -161,6 +184,123 @@ func TestHealthEndpoints(t *testing.T) {
 
 		if result["version"] == nil {
 			t.Error("Expected version field")
+		}
+	})
+}
+
+// TestCORSMiddleware tests CORS header behaviour
+func TestCORSMiddleware(t *testing.T) {
+	// Create a server with CORS enabled
+	tmpDir, err := os.MkdirTemp("", "olu-cors-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &config.Config{
+		Host:               "localhost",
+		Port:               0,
+		BaseDir:            tmpDir,
+		Schema:             "test_schema",
+		SchemaDir:          filepath.Join(tmpDir, "test_schema"),
+		CacheType:          "memory",
+		CacheTTL:           300,
+		GraphEnabled:       true,
+		GraphMode:          "indexed",
+		FullTextEnabled:    false,
+		CascadingDelete:    false,
+		RefEmbedDepth:      3,
+		MaxEmbedDepth:      10,
+		MaxEntitySize:      1048576,
+		PatchNullBehavior:  "store",
+		GraphDataFile:      filepath.Join(tmpDir, "graph.data"),
+		GraphIndexFile:     filepath.Join(tmpDir, "graph.index"),
+		MaxCascadeDeletions: 100,
+		TenantMode:          "path",
+		TenantAutoRegister:  true,
+		CORSOrigins:         []string{"https://dashboard.example.com", "https://admin.example.com"},
+	}
+
+	storeConfig := map[string]interface{}{
+		"base_dir": cfg.BaseDir,
+		"schema":   cfg.Schema,
+	}
+	store, err := storage.NewStore("jsonfile", storeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	memCache := cache.NewMemoryCache(1000, time.Duration(cfg.CacheTTL)*time.Second)
+	g := graph.NewIndexedGraph()
+	schemaDir := filepath.Join(cfg.BaseDir, cfg.Schema, "_schemas")
+	validator := validation.NewJSONSchemaValidator(schemaDir)
+	logger := zerolog.New(os.Stdout).Level(zerolog.Disabled)
+
+	srv := server.New(cfg, store, memCache, g, nil, validator, logger)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	t.Run("allowed origin gets CORS headers", func(t *testing.T) {
+		req, _ := http.NewRequest("GET", ts.URL+"/health", nil)
+		req.Header.Set("Origin", "https://dashboard.example.com")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		acao := resp.Header.Get("Access-Control-Allow-Origin")
+		if acao != "https://dashboard.example.com" {
+			t.Errorf("Expected ACAO header 'https://dashboard.example.com', got %q", acao)
+		}
+	})
+
+	t.Run("disallowed origin gets no CORS headers", func(t *testing.T) {
+		req, _ := http.NewRequest("GET", ts.URL+"/health", nil)
+		req.Header.Set("Origin", "https://evil.example.com")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		acao := resp.Header.Get("Access-Control-Allow-Origin")
+		if acao != "" {
+			t.Errorf("Expected no ACAO header for disallowed origin, got %q", acao)
+		}
+	})
+
+	t.Run("preflight OPTIONS returns 204", func(t *testing.T) {
+		req, _ := http.NewRequest("OPTIONS", ts.URL+"/api/v1/test", nil)
+		req.Header.Set("Origin", "https://dashboard.example.com")
+		req.Header.Set("Access-Control-Request-Method", "POST")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusNoContent {
+			t.Errorf("Expected 204 for preflight, got %d", resp.StatusCode)
+		}
+
+		methods := resp.Header.Get("Access-Control-Allow-Methods")
+		if methods == "" {
+			t.Error("Expected Access-Control-Allow-Methods header")
+		}
+	})
+
+	t.Run("no origin header skips CORS", func(t *testing.T) {
+		req, _ := http.NewRequest("GET", ts.URL+"/health", nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		acao := resp.Header.Get("Access-Control-Allow-Origin")
+		if acao != "" {
+			t.Errorf("Expected no ACAO header when no Origin sent, got %q", acao)
 		}
 	})
 }
@@ -614,11 +754,53 @@ func TestErrorHandling(t *testing.T) {
 	t.Run("Invalid JSON body", func(t *testing.T) {
 		req, _ := http.NewRequest("POST", ts.ts.URL+"/api/v1/users", bytes.NewBufferString("invalid json"))
 		req.Header.Set("Content-Type", "application/json")
-		resp, _ := http.DefaultClient.Do(req)
+		resp, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			t.Fatalf("request failed: %v", doErr)
+		}
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("Expected 400, got %d", resp.StatusCode)
 		}
 	})
+}
+
+// TestErrorResponseEnvelope verifies that API error responses use the
+// structured envelope: {"error": {"code": "OLU-...", "message": "...", "status": N}}.
+// This catches regressions if someone changes writeError or adds a new
+// error path that uses the old flat format.
+func TestErrorResponseEnvelope(t *testing.T) {
+	ts := setupTestServer(t)
+	defer ts.cleanup()
+
+	// Trigger a writeError response — invalid ID is the simplest case.
+	resp, body := ts.doRequest("GET", "/api/v1/users/invalid", nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("Expected 400, got %d", resp.StatusCode)
+	}
+
+	var envelope map[string]interface{}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatalf("Response is not valid JSON: %v", err)
+	}
+
+	errObj, ok := envelope["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected nested 'error' object, got %T: %v", envelope["error"], envelope["error"])
+	}
+
+	// Verify all three required fields exist
+	code, ok := errObj["code"].(string)
+	if !ok || code == "" {
+		t.Errorf("error.code missing or empty: %v", errObj["code"])
+	}
+	msg, ok := errObj["message"].(string)
+	if !ok || msg == "" {
+		t.Errorf("error.message missing or empty: %v", errObj["message"])
+	}
+	status, ok := errObj["status"].(float64) // JSON numbers are float64
+	if !ok || status != 400 {
+		t.Errorf("error.status expected 400, got %v", errObj["status"])
+	}
 }
 
 // ============================================================================
@@ -654,6 +836,8 @@ func setupTestServerWithFTS(t *testing.T) *TestServer {
 		GraphDataFile:      filepath.Join(tmpDir, "graph.data"),
 		GraphIndexFile:     filepath.Join(tmpDir, "graph.index"),
 		MaxCascadeDeletions: 100,
+		TenantMode:          "path",
+		TenantAutoRegister:  true, // Tests rely on auto-registration
 	}
 
 	storeConfig := map[string]interface{}{
@@ -907,6 +1091,7 @@ func TestOQLQueryEndpoint(t *testing.T) {
 	cfg := &config.Config{
 		Host:                "localhost",
 		Port:                0,
+		StorageType:        "jsonfile",
 		BaseDir:             tmpDir,
 		Schema:              "test_schema",
 		SchemaDir:           filepath.Join(tmpDir, "test_schema"),
@@ -948,7 +1133,10 @@ func TestOQLQueryEndpoint(t *testing.T) {
 		if body != nil {
 			req.Header.Set("Content-Type", "application/json")
 		}
-		resp, _ := http.DefaultClient.Do(req)
+		resp, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			t.Fatalf("request failed: %v", doErr)
+		}
 		defer resp.Body.Close()
 		respBody := &bytes.Buffer{}
 		respBody.ReadFrom(resp.Body)
@@ -1081,6 +1269,7 @@ func TestOQLAsyncEndpoint(t *testing.T) {
 	cfg := &config.Config{
 		Host:                "localhost",
 		Port:                0,
+		StorageType:        "jsonfile",
 		BaseDir:             tmpDir,
 		Schema:              "test_schema",
 		SchemaDir:           filepath.Join(tmpDir, "test_schema"),
@@ -1122,7 +1311,10 @@ func TestOQLAsyncEndpoint(t *testing.T) {
 		if body != nil {
 			req.Header.Set("Content-Type", "application/json")
 		}
-		resp, _ := http.DefaultClient.Do(req)
+		resp, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			t.Fatalf("request failed: %v", doErr)
+		}
 		defer resp.Body.Close()
 		respBody := &bytes.Buffer{}
 		respBody.ReadFrom(resp.Body)
@@ -1197,24 +1389,94 @@ func TestSulpherQueryEndpoint(t *testing.T) {
 // ============================================================================
 
 func TestTenantIsolation(t *testing.T) {
-	ts := setupTestServer(t)
-	defer ts.cleanup()
+	// Tenant isolation on point operations (Get/Put/Delete by ID) requires
+	// a storage backend that scopes by tenant_id. The jsonfile backend does
+	// not support this; use SQLite.
+	tmpDir, err := os.MkdirTemp("", "olu-tenant-iso-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "tenant_iso.db")
+	cfg := &config.Config{
+		Host:                "localhost",
+		Port:                0,
+		StorageType:        "sqlite",
+		DBPath:              dbPath,
+		BaseDir:             tmpDir,
+		Schema:              "test_schema",
+		SchemaDir:           filepath.Join(tmpDir, "test_schema"),
+		CacheType:           "memory",
+		CacheTTL:            300,
+		GraphEnabled:        true,
+		GraphMode:           "indexed",
+		FullTextEnabled:     false,
+		CascadingDelete:     false,
+		RefEmbedDepth:       3,
+		MaxEmbedDepth:       10,
+		MaxEntitySize:       1048576,
+		PatchNullBehavior:   "store",
+		GraphDataFile:       filepath.Join(tmpDir, "graph.data"),
+		GraphIndexFile:      filepath.Join(tmpDir, "graph.index"),
+		MaxCascadeDeletions: 100,
+		TenantMode:          "path",
+		TenantAutoRegister:  true, // Tests rely on auto-registration
+	}
+
+	sqliteStore, err := storage.NewStoreFromConfig(storage.StoreConfig{
+		Type:   "sqlite",
+		DBPath: dbPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqliteStore.Close()
+
+	memCache := cache.NewMemoryCache(1000, time.Duration(cfg.CacheTTL)*time.Second)
+	g := graph.NewIndexedGraph()
+	schemaDir := filepath.Join(cfg.BaseDir, cfg.Schema, "_schemas")
+	validator := validation.NewJSONSchemaValidator(schemaDir)
+	logger := zerolog.New(os.Stdout).Level(zerolog.Disabled)
+
+	srv := server.New(cfg, sqliteStore, memCache, g, nil, validator, logger)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	doReq := func(method, path string, body interface{}) (*http.Response, []byte) {
+		var bodyBytes []byte
+		if body != nil {
+			bodyBytes, _ = json.Marshal(body)
+		}
+		req, _ := http.NewRequest(method, ts.URL+path, bytes.NewBuffer(bodyBytes))
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			t.Fatalf("request failed: %v", doErr)
+		}
+		defer resp.Body.Close()
+		respBody := &bytes.Buffer{}
+		respBody.ReadFrom(resp.Body)
+		return resp, respBody.Bytes()
+	}
 
 	// Create entities in tenant1
-	ts.doRequest("POST", "/api/v1/tenant/tenant1/users", map[string]interface{}{
+	doReq("POST", "/api/v1/tenant/tenant1/users", map[string]interface{}{
 		"name": "Alice",
 	})
-	ts.doRequest("POST", "/api/v1/tenant/tenant1/users", map[string]interface{}{
+	doReq("POST", "/api/v1/tenant/tenant1/users", map[string]interface{}{
 		"name": "Bob",
 	})
 
 	// Create entity in tenant2
-	ts.doRequest("POST", "/api/v1/tenant/tenant2/users", map[string]interface{}{
+	doReq("POST", "/api/v1/tenant/tenant2/users", map[string]interface{}{
 		"name": "Carol",
 	})
 
 	t.Run("List only shows tenant's data", func(t *testing.T) {
-		resp, body := ts.doRequest("GET", "/api/v1/tenant/tenant1/users", nil)
+		resp, body := doReq("GET", "/api/v1/tenant/tenant1/users", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Expected 200, got %d", resp.StatusCode)
 		}
@@ -1229,15 +1491,16 @@ func TestTenantIsolation(t *testing.T) {
 	})
 
 	t.Run("Get from wrong tenant returns 404", func(t *testing.T) {
-		// Entity 1 is in tenant1, try to access from tenant2
-		resp, _ := ts.doRequest("GET", "/api/v1/tenant/tenant2/users/1", nil)
+		// Tenant1 has id=1 (Alice) and id=2 (Bob). Tenant2 has id=1 (Carol).
+		// Querying tenant2 for id=2 should return 404 — that ID only exists in tenant1.
+		resp, body := doReq("GET", "/api/v1/tenant/tenant2/users/2", nil)
 		if resp.StatusCode != http.StatusNotFound {
-			t.Errorf("Expected 404 for cross-tenant access, got %d", resp.StatusCode)
+			t.Errorf("Expected 404 for cross-tenant access, got %d; body: %s", resp.StatusCode, string(body))
 		}
 	})
 
 	t.Run("Update in wrong tenant fails", func(t *testing.T) {
-		resp, _ := ts.doRequest("PUT", "/api/v1/tenant/tenant2/users/1", map[string]interface{}{
+		resp, _ := doReq("PUT", "/api/v1/tenant/tenant2/users/2", map[string]interface{}{
 			"name": "Hacked",
 		})
 		if resp.StatusCode != http.StatusNotFound {
@@ -1246,7 +1509,7 @@ func TestTenantIsolation(t *testing.T) {
 	})
 
 	t.Run("Delete in wrong tenant fails", func(t *testing.T) {
-		resp, _ := ts.doRequest("DELETE", "/api/v1/tenant/tenant2/users/1", nil)
+		resp, _ := doReq("DELETE", "/api/v1/tenant/tenant2/users/2", nil)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected 404 for cross-tenant delete, got %d", resp.StatusCode)
 		}
@@ -1353,6 +1616,7 @@ func TestTenantStrictMode(t *testing.T) {
 	cfg := &config.Config{
 		Host:                "localhost",
 		Port:                0,
+		StorageType:        "jsonfile",
 		BaseDir:             tmpDir,
 		Schema:              "test_schema",
 		SchemaDir:           filepath.Join(tmpDir, "test_schema"),
@@ -1367,7 +1631,7 @@ func TestTenantStrictMode(t *testing.T) {
 		GraphDataFile:       filepath.Join(tmpDir, "graph.data"),
 		GraphIndexFile:      filepath.Join(tmpDir, "graph.index"),
 		MaxCascadeDeletions: 100,
-		TenantMode:          "strict", // Enable strict mode
+		TenantMode:          "strict", // Explicit: tenants must be pre-registered
 		AuthType:            "none",
 	}
 
@@ -1383,6 +1647,10 @@ func TestTenantStrictMode(t *testing.T) {
 	logger := zerolog.New(os.Stdout).Level(zerolog.Disabled)
 
 	srv := server.New(cfg, store, memCache, g, nil, validator, logger)
+
+	// In strict mode, tenants must be pre-registered before use.
+	srv.TenantRegistry().Register(context.Background(), "acme", 1)
+
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -1395,7 +1663,10 @@ func TestTenantStrictMode(t *testing.T) {
 		if body != nil {
 			req.Header.Set("Content-Type", "application/json")
 		}
-		resp, _ := http.DefaultClient.Do(req)
+		resp, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			t.Fatalf("request failed: %v", doErr)
+		}
 		defer resp.Body.Close()
 		respBody := &bytes.Buffer{}
 		respBody.ReadFrom(resp.Body)
@@ -1434,10 +1705,12 @@ func TestTenantStrictMode(t *testing.T) {
 		}
 	})
 
-	t.Run("Graph routes allowed", func(t *testing.T) {
+	t.Run("Graph routes blocked in strict mode", func(t *testing.T) {
 		resp, _ := doReq("GET", "/api/v1/graph/stats", nil)
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("Expected 200 for graph stats, got %d", resp.StatusCode)
+		// Graph is automatically disabled in strict mode (not tenant-isolated).
+		// The middleware blocks all non-tenant, non-schema /api/v1/ routes.
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("Expected 403 for graph stats in strict mode, got %d", resp.StatusCode)
 		}
 	})
 }

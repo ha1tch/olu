@@ -1,3 +1,7 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package oql
 
 import (
@@ -6,6 +10,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/ha1tch/olu/pkg/storage"
 )
 
 // mockStore implements storage.Store for testing
@@ -55,6 +61,10 @@ func (m *mockStore) Patch(ctx context.Context, entity string, id int, data map[s
 	return m.Update(ctx, entity, id, data)
 }
 
+func (m *mockStore) PatchValidated(ctx context.Context, entity string, id int, data map[string]interface{}, validate func(merged map[string]interface{}) error) error {
+	return m.Patch(ctx, entity, id, data)
+}
+
 func (m *mockStore) Delete(ctx context.Context, entity string, id int) error {
 	records := m.data[entity]
 	for i, r := range records {
@@ -83,12 +93,20 @@ func (m *mockStore) Close() error {
 	return nil
 }
 
+func (m *mockStore) Config() storage.StoreConfig {
+	return storage.StoreConfig{Type: "mock"}
+}
+
 func (m *mockStore) Search(ctx context.Context, entity string, field string, query string, matchType string) ([]map[string]interface{}, error) {
 	return []map[string]interface{}{}, nil
 }
 
 func (m *mockStore) FullTextSearch(ctx context.Context, query string, entity string) ([]map[string]interface{}, error) {
 	return []map[string]interface{}{}, nil
+}
+
+func (m *mockStore) Ping(ctx context.Context) error {
+	return nil
 }
 
 // setupTestEngine creates an OQL engine with test data
@@ -420,8 +438,8 @@ func TestJobManager(t *testing.T) {
 	jm := NewJobManager(engine, 60)
 	defer jm.Close()
 
-	// Submit async query
-	queryID := jm.Submit("SELECT * FROM items")
+	// Submit async query (nil store = use engine default, appropriate for non-tenant test)
+	queryID := jm.Submit("SELECT * FROM items", nil)
 	if queryID == "" {
 		t.Fatal("Submit returned empty query ID")
 	}

@@ -21,18 +21,18 @@ services:
     ports:
       - "9090:9090"
     environment:
-      - HOST=0.0.0.0
-      - PORT=9090
-      - STORAGE_TYPE=jsonfile
-      - CACHE_TYPE=memory
-      - CACHE_TTL=300
-      - RSERV_GRAPH=indexed
-      - GRAPH_CYCLE_DETECTION=warn
-      - FULLTEXT_ENABLED=false
-      - CASCADING_DELETE=false
-      - AUTH_TYPE=none
-      - METRICS_ENABLED=true
-      - DEBUG=false
+      - OLU_HOST=0.0.0.0
+      - OLU_PORT=9090
+      - OLU_STORAGE_TYPE=jsonfile
+      - OLU_CACHE_TYPE=memory
+      - OLU_CACHE_TTL=300
+      - OLU_GRAPH_MODE=indexed
+      - OLU_GRAPH_CYCLE_DETECTION=warn
+      - OLU_FULLTEXT_ENABLED=false
+      - OLU_CASCADING_DELETE=false
+      - OLU_AUTH_TYPE=none
+      - OLU_METRICS_ENABLED=true
+      - OLU_DEBUG=false
     volumes:
       - ./data:/app/data
       - ./schema:/app/schema
@@ -48,18 +48,18 @@ services:
     ports:
       - "9090:9090"
     environment:
-      - HOST=0.0.0.0
-      - PORT=9090
-      - STORAGE_TYPE=jsonfile
-      - CACHE_TYPE=redis
-      - CACHE_TTL=300
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - RSERV_GRAPH=indexed
-      - GRAPH_CYCLE_DETECTION=warn
-      - FULLTEXT_ENABLED=false
-      - AUTH_TYPE=none
-      - METRICS_ENABLED=true
+      - OLU_HOST=0.0.0.0
+      - OLU_PORT=9090
+      - OLU_STORAGE_TYPE=jsonfile
+      - OLU_CACHE_TYPE=redis
+      - OLU_CACHE_TTL=300
+      - OLU_REDIS_HOST=redis
+      - OLU_REDIS_PORT=6379
+      - OLU_GRAPH_MODE=indexed
+      - OLU_GRAPH_CYCLE_DETECTION=warn
+      - OLU_FULLTEXT_ENABLED=false
+      - OLU_AUTH_TYPE=none
+      - OLU_METRICS_ENABLED=true
     volumes:
       - ./data:/app/data
       - ./schema:/app/schema
@@ -91,32 +91,32 @@ services:
       - "9090:9090"
     environment:
       # Server
-      - HOST=0.0.0.0
-      - PORT=9090
+      - OLU_HOST=0.0.0.0
+      - OLU_PORT=9090
       # Storage - SQLite with full-text search
-      - STORAGE_TYPE=sqlite
-      - DB_PATH=/app/data/olu.db
-      - FULLTEXT_ENABLED=true
+      - OLU_STORAGE_TYPE=sqlite
+      - OLU_DB_PATH=/app/data/olu.db
+      - OLU_FULLTEXT_ENABLED=true
       # Cache - Redis
-      - CACHE_TYPE=redis
-      - CACHE_TTL=300
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      - OLU_CACHE_TYPE=redis
+      - OLU_CACHE_TTL=300
+      - OLU_REDIS_HOST=redis
+      - OLU_REDIS_PORT=6379
       # Graph
-      - RSERV_GRAPH=indexed
-      - GRAPH_CYCLE_DETECTION=error
+      - OLU_GRAPH_MODE=indexed
+      - OLU_GRAPH_CYCLE_DETECTION=error
       # Authentication - API keys (simpler to test than JWT)
-      - AUTH_TYPE=apikey
-      - API_KEYS=test-key-1,test-key-2,admin-key
+      - OLU_AUTH_TYPE=apikey
+      - OLU_API_KEYS=test-key-1,test-key-2,admin-key
       # Rate limiting
-      - RATE_LIMIT_ENABLED=true
-      - RATE_LIMIT_RATE=100
-      - RATE_LIMIT_WINDOW=60
-      - RATE_LIMIT_BY_KEY=true
+      - OLU_RATE_LIMIT_ENABLED=true
+      - OLU_RATE_LIMIT_RATE=100
+      - OLU_RATE_LIMIT_WINDOW=60
+      - OLU_RATE_LIMIT_BY_KEY=true
       # Metrics
-      - METRICS_ENABLED=true
+      - OLU_METRICS_ENABLED=true
       # Multi-tenancy
-      - TENANT_MODE=path
+      - OLU_TENANT_MODE=path
     volumes:
       - ./data:/app/data
       - ./schema:/app/schema
@@ -134,23 +134,23 @@ services:
     ports:
       - "9090:9090"
     environment:
-      - HOST=0.0.0.0
-      - PORT=9090
-      - STORAGE_TYPE=sqlite
-      - DB_PATH=/app/data/test.db
-      - FULLTEXT_ENABLED=true
-      - CACHE_TYPE=redis
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - RSERV_GRAPH=indexed
-      - AUTH_TYPE=apikey
-      - API_KEYS=test-key
-      - RATE_LIMIT_ENABLED=true
-      - RATE_LIMIT_RATE=100
-      - RATE_LIMIT_WINDOW=10
-      - METRICS_ENABLED=true
-      - TENANT_MODE=path
-      - DEBUG=true
+      - OLU_HOST=0.0.0.0
+      - OLU_PORT=9090
+      - OLU_STORAGE_TYPE=sqlite
+      - OLU_DB_PATH=/app/data/test.db
+      - OLU_FULLTEXT_ENABLED=true
+      - OLU_CACHE_TYPE=redis
+      - OLU_REDIS_HOST=redis
+      - OLU_REDIS_PORT=6379
+      - OLU_GRAPH_MODE=indexed
+      - OLU_AUTH_TYPE=apikey
+      - OLU_API_KEYS=test-key
+      - OLU_RATE_LIMIT_ENABLED=true
+      - OLU_RATE_LIMIT_RATE=100
+      - OLU_RATE_LIMIT_WINDOW=10
+      - OLU_METRICS_ENABLED=true
+      - OLU_TENANT_MODE=path
+      - OLU_DEBUG=true
     volumes:
       - test_data:/app/data
       - ./schema:/app/schema

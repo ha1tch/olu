@@ -1,3 +1,7 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package middleware
 
 import (
@@ -10,7 +14,9 @@ import (
 	"github.com/ha1tch/olu/pkg/config"
 )
 
-// RateLimiter implements a sliding window rate limiter
+// RateLimiter implements a fixed-window rate limiter. This allows up to 2x
+// burst at window boundaries; a sliding-window approach would prevent that
+// but adds complexity. Acceptable for the current use case.
 type RateLimiter struct {
 	mu      sync.RWMutex
 	windows map[string]*window
@@ -142,8 +148,11 @@ func RateLimitMiddleware(cfg *config.Config, limiter *RateLimiter) func(http.Han
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusTooManyRequests)
 				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"error":       "Too Many Requests",
-					"message":     "Rate limit exceeded",
+					"error": map[string]interface{}{
+						"code":    "OLU-RL001",
+						"message": "Rate limit exceeded",
+						"status":  http.StatusTooManyRequests,
+					},
 					"retry_after": int(time.Until(resetTime).Seconds()) + 1,
 				})
 				return

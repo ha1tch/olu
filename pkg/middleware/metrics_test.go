@@ -1,3 +1,7 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package middleware
 
 import (
@@ -161,6 +165,8 @@ func TestMetrics_PrometheusFormat(t *testing.T) {
 		"olu_request_errors_total",
 		"olu_active_requests",
 		"olu_request_duration_seconds_bucket",
+		"olu_request_duration_seconds_sum",
+		"olu_request_duration_seconds_count",
 		"olu_entity_operations_total",
 		"olu_cache_total",
 		"olu_queries_total",

@@ -1,3 +1,7 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package version
 
 import (
@@ -6,6 +10,7 @@ import (
 )
 
 func TestVersion(t *testing.T) {
+	t.Parallel()
 	if Version == "" {
 		t.Error("Version should not be empty")
 	}

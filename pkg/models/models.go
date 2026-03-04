@@ -1,3 +1,7 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package models
 
 import (
@@ -105,6 +109,7 @@ type SortParam struct {
 // ErrorResponse represents an API error response
 type ErrorResponse struct {
 	Error struct {
+		Code    string `json:"code"`
 		Message string `json:"message"`
 		Status  int    `json:"status"`
 	} `json:"error"`

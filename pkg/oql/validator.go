@@ -1,32 +1,55 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package oql
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/ha1tch/tsqlparser/ast"
 )
 
-// Validator validates OQL queries against schema
-type Validator struct {
-	schemaDir string
-	entities  map[string]bool // Cached entity names
+// EntityChecker is an interface for checking entity existence
+type EntityChecker interface {
+	ListEntities(ctx context.Context) ([]string, error)
 }
 
-// NewValidator creates a new validator
+// Validator validates OQL queries against schema
+type Validator struct {
+	schemaDir     string
+	entities      map[string]bool // Cached entity names
+	entityChecker EntityChecker   // Optional store-based checker
+}
+
+// NewValidator creates a new validator that checks the filesystem
 func NewValidator(schemaDir string) *Validator {
 	v := &Validator{
 		schemaDir: schemaDir,
 		entities:  make(map[string]bool),
 	}
-	v.loadEntities()
+	v.loadEntitiesFromDisk()
 	return v
 }
 
-// loadEntities scans the schema directory for entity folders
-func (v *Validator) loadEntities() {
+// NewValidatorWithStore creates a validator that checks the store for entities
+func NewValidatorWithStore(schemaDir string, checker EntityChecker) *Validator {
+	v := &Validator{
+		schemaDir:     schemaDir,
+		entities:      make(map[string]bool),
+		entityChecker: checker,
+	}
+	v.RefreshEntities()
+	return v
+}
+
+// loadEntitiesFromDisk scans the schema directory for entity folders
+func (v *Validator) loadEntitiesFromDisk() {
 	entries, err := os.ReadDir(v.schemaDir)
 	if err != nil {
 		return
@@ -39,16 +62,39 @@ func (v *Validator) loadEntities() {
 	}
 }
 
-// RefreshEntities reloads the entity list from the schema directory.
-// This is called automatically when EntityExists encounters an unknown entity,
-// so manual calls are typically unnecessary.
+// loadEntitiesFromStore queries the store for entity types
+func (v *Validator) loadEntitiesFromStore() {
+	if v.entityChecker == nil {
+		return
+	}
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	entities, err := v.entityChecker.ListEntities(ctx)
+	if err != nil {
+		return
+	}
+	
+	for _, entity := range entities {
+		v.entities[entity] = true
+	}
+}
+
+// RefreshEntities reloads the entity list.
+// If a store checker is configured, it queries the store.
+// Otherwise, it scans the filesystem.
 func (v *Validator) RefreshEntities() {
 	v.entities = make(map[string]bool)
-	v.loadEntities()
+	if v.entityChecker != nil {
+		v.loadEntitiesFromStore()
+	}
+	// Always also check disk for schema definitions
+	v.loadEntitiesFromDisk()
 }
 
 // EntityExists checks if an entity exists.
-// If the entity is not in the cache, it automatically refreshes from disk
+// If the entity is not in the cache, it automatically refreshes
 // before returning false. This ensures newly created entity types are
 // recognised without requiring manual refresh.
 func (v *Validator) EntityExists(name string) bool {
@@ -60,7 +106,7 @@ func (v *Validator) EntityExists(name string) bool {
 		return true
 	}
 	
-	// Entity not in cache - refresh from disk and retry
+	// Entity not in cache - refresh and retry
 	// This handles dynamically created entity types
 	v.RefreshEntities()
 	return v.entities[name]

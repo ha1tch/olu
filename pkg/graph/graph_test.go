@@ -1,3 +1,7 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package graph
 
 import (
@@ -24,6 +28,7 @@ func mustAddEdge(t *testing.T, g *IndexedGraph, from, to, relType string) {
 }
 
 func TestNewIndexedGraph(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraph()
 	if g == nil {
 		t.Fatal("NewIndexedGraph returned nil")
@@ -37,6 +42,7 @@ func TestNewIndexedGraph(t *testing.T) {
 }
 
 func TestAddRemoveNode(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraph()
 
 	// Add node
@@ -80,6 +86,7 @@ func TestAddRemoveNode(t *testing.T) {
 }
 
 func TestAddRemoveEdge(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraph()
 
 	// Add nodes first
@@ -136,6 +143,7 @@ func TestAddRemoveEdge(t *testing.T) {
 }
 
 func TestGetNeighbors(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraph()
 
 	mustAddNode(t, g, "users:1", "users")
@@ -169,6 +177,7 @@ func TestGetNeighbors(t *testing.T) {
 }
 
 func TestGetIncomingEdges(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraph()
 
 	mustAddNode(t, g, "users:1", "users")
@@ -195,6 +204,7 @@ func TestGetIncomingEdges(t *testing.T) {
 }
 
 func TestFindPath(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraph()
 
 	// Create chain: 1 -> 2 -> 3 -> 4
@@ -240,6 +250,7 @@ func TestFindPath(t *testing.T) {
 }
 
 func TestFindPathMaxDepth(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraph()
 
 	// Create chain: 1 -> 2 -> 3 -> 4 -> 5
@@ -267,6 +278,7 @@ func TestFindPathMaxDepth(t *testing.T) {
 }
 
 func TestPathExists(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraph()
 
 	_ = g.AddNode("a:1", "a")
@@ -308,6 +320,7 @@ func TestPathExists(t *testing.T) {
 }
 
 func TestHasCycle(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraph()
 
 	// Acyclic graph
@@ -330,6 +343,7 @@ func TestHasCycle(t *testing.T) {
 }
 
 func TestCommonNeighbors(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraph()
 
 	// Setup: A -> C, A -> D, B -> C, B -> E
@@ -368,6 +382,7 @@ func TestCommonNeighbors(t *testing.T) {
 }
 
 func TestGetNodesByType(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraph()
 
 	_ = g.AddNode("users:1", "users")
@@ -393,6 +408,7 @@ func TestGetNodesByType(t *testing.T) {
 }
 
 func TestGetDegree(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraph()
 
 	_ = g.AddNode("n:1", "node")
@@ -419,6 +435,7 @@ func TestGetDegree(t *testing.T) {
 }
 
 func TestGetNodeInfo(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraph()
 
 	_ = g.AddNode("users:42", "users")
@@ -448,6 +465,7 @@ func TestGetNodeInfo(t *testing.T) {
 }
 
 func TestSaveLoad(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraph()
 
 	_ = g.AddNode("users:1", "users")
@@ -518,6 +536,7 @@ func TestSaveLoad(t *testing.T) {
 }
 
 func TestLoadLegacyFormat(t *testing.T) {
+	t.Parallel()
 	// Create a file in legacy format
 	legacyContent := `users:1:users:2:FOLLOWS posts:1:AUTHORED
 users:2:`
@@ -543,6 +562,7 @@ users:2:`
 }
 
 func TestClear(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraph()
 
 	_ = g.AddNode("n:1", "node")
@@ -563,6 +583,7 @@ func TestClear(t *testing.T) {
 }
 
 func TestConcurrentAccess(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraph()
 
 	// Pre-populate
@@ -608,6 +629,7 @@ func TestConcurrentAccess(t *testing.T) {
 }
 
 func TestRemoveNodeCascadesEdges(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraph()
 
 	_ = g.AddNode("n:1", "node")
@@ -646,6 +668,7 @@ func TestRemoveNodeCascadesEdges(t *testing.T) {
 // ============================================================================
 
 func TestNewIndexedGraphWithCycleDetection(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		mode string
 	}{
@@ -663,6 +686,7 @@ func TestNewIndexedGraphWithCycleDetection(t *testing.T) {
 }
 
 func TestSetCycleDetection(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraph()
 	
 	g.SetCycleDetection("error")
@@ -673,6 +697,7 @@ func TestSetCycleDetection(t *testing.T) {
 }
 
 func TestCycleDetection_Ignore(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraphWithCycleDetection("ignore")
 
 	_ = g.AddNode("n:1", "node")
@@ -696,6 +721,7 @@ func TestCycleDetection_Ignore(t *testing.T) {
 }
 
 func TestCycleDetection_Warn(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraphWithCycleDetection("warn")
 
 	_ = g.AddNode("n:1", "node")
@@ -718,6 +744,7 @@ func TestCycleDetection_Warn(t *testing.T) {
 }
 
 func TestCycleDetection_Error(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraphWithCycleDetection("error")
 
 	_ = g.AddNode("n:1", "node")
@@ -743,6 +770,7 @@ func TestCycleDetection_Error(t *testing.T) {
 }
 
 func TestCycleDetection_SelfLoop(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraphWithCycleDetection("error")
 
 	_ = g.AddNode("n:1", "node")
@@ -755,6 +783,7 @@ func TestCycleDetection_SelfLoop(t *testing.T) {
 }
 
 func TestCycleDetection_NoCycle(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraphWithCycleDetection("error")
 
 	_ = g.AddNode("n:1", "node")
@@ -790,6 +819,7 @@ func TestCycleDetection_NoCycle(t *testing.T) {
 }
 
 func TestCycleDetection_LongPath(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraphWithCycleDetection("error")
 
 	// Create a long chain: 1 -> 2 -> 3 -> 4 -> 5
@@ -812,6 +842,7 @@ func TestCycleDetection_LongPath(t *testing.T) {
 }
 
 func TestCycleDetection_ParallelEdges(t *testing.T) {
+	t.Parallel()
 	g := NewIndexedGraphWithCycleDetection("error")
 
 	_ = g.AddNode("n:1", "node")

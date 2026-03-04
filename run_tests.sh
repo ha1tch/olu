@@ -1,188 +1,116 @@
 #!/bin/bash
 
-# Test Runner Script for Olu
-# Runs comprehensive tests with colored output
+# run_tests.sh - olu base test suite with coverage reporting
+#
+# Coverage reporting is always on. Every run produces coverage.out
+# and a per-package summary.
+#
+# Usage:
+#   ./run_tests.sh                  Standard run (short mode)
+#   ./run_tests.sh --redis          Include Redis backend tests
+#   ./run_tests.sh --full           Include stress tests (no -short)
+#   ./run_tests.sh --race           Enable race detector
+#   ./run_tests.sh --threshold 75   Fail if aggregate coverage below 75%
+#   ./run_tests.sh --html           Generate coverage.html report
+#
+# Copyright (c) 2026 haitch
+# Licensed under Apache 2.0
 
-set -e
+set -uo pipefail
 
-# Colors
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-echo -e "${BLUE}╔══════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║     Olu Comprehensive Test Suite    ║${NC}"
-echo -e "${BLUE}╚══════════════════════════════════════╝${NC}"
-echo ""
-
-# Function to print section headers
-print_header() {
-    echo -e "${BLUE}▶ $1${NC}"
-}
-
-# Function to print success
-print_success() {
-    echo -e "${GREEN}✓ $1${NC}"
-}
-
-# Function to print error
-print_error() {
-    echo -e "${RED}✗ $1${NC}"
-}
-
-# Function to print info
-print_info() {
-    echo -e "${YELLOW}ℹ $1${NC}"
-}
-
-# Parse command line arguments
-RUN_BENCHMARKS=false
-RUN_RACE=false
-RUN_COVERAGE=false
-VERBOSE=false
+# Defaults
+SHORT="-short"
+TAGS=""
+RACE=""
+THRESHOLD=""
+HTML=false
 
 while [[ $# -gt 0 ]]; do
-    case $1 in
-        -b|--benchmark)
-            RUN_BENCHMARKS=true
-            shift
-            ;;
-        -r|--race)
-            RUN_RACE=true
-            shift
-            ;;
-        -c|--coverage)
-            RUN_COVERAGE=true
-            shift
-            ;;
-        -v|--verbose)
-            VERBOSE=true
-            shift
-            ;;
-        -h|--help)
-            echo "Usage: ./run_tests.sh [options]"
-            echo ""
-            echo "Options:"
-            echo "  -b, --benchmark    Run benchmarks"
-            echo "  -r, --race         Run race detector"
-            echo "  -c, --coverage     Generate coverage report"
-            echo "  -v, --verbose      Verbose output"
-            echo "  -h, --help         Show this help"
-            echo ""
-            echo "Examples:"
-            echo "  ./run_tests.sh                    # Run all tests"
-            echo "  ./run_tests.sh -b                 # Run tests and benchmarks"
-            echo "  ./run_tests.sh -r -c              # Run with race detector and coverage"
-            exit 0
-            ;;
+    case "$1" in
+        --redis)     TAGS="-tags redis"; shift ;;
+        --full)      SHORT=""; shift ;;
+        --race)      RACE="-race"; shift ;;
+        --html)      HTML=true; shift ;;
+        --threshold) THRESHOLD="$2"; shift 2 ;;
+        --help|-h)
+            sed -n '3,15p' "$0" | sed 's/^# \?//'
+            exit 0 ;;
         *)
-            echo "Unknown option: $1"
-            echo "Use -h or --help for usage information"
-            exit 1
-            ;;
+            echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
 
-# Track failures
-FAILED=false
+COVERFILE="coverage.out"
 
-# Unit Tests
-print_header "Running Unit Tests (Storage Layer)..."
-if $VERBOSE; then
-    if go test -v ./pkg/storage/; then
-        print_success "Unit tests passed"
-    else
-        print_error "Unit tests failed"
-        FAILED=true
-    fi
-else
-    if go test ./pkg/storage/ 2>&1 | grep -E "(PASS|FAIL|ok|FAIL)"; then
-        print_success "Unit tests passed"
-    else
-        print_error "Unit tests failed"
-        FAILED=true
-    fi
-fi
+echo "olu test suite"
+echo "=============="
 echo ""
 
-# Integration Tests
-print_header "Running Integration Tests (HTTP Server)..."
-if $VERBOSE; then
-    if go test -v ./pkg/server/; then
-        print_success "Integration tests passed"
-    else
-        print_error "Integration tests failed"
-        FAILED=true
-    fi
-else
-    if go test ./pkg/server/ 2>&1 | grep -E "(PASS|FAIL|ok|FAIL)"; then
-        print_success "Integration tests passed"
-    else
-        print_error "Integration tests failed"
-        FAILED=true
-    fi
+# --- Run ---
+
+# shellcheck disable=SC2086
+OUTPUT=$(go test $SHORT $TAGS $RACE -count=1 -coverprofile="$COVERFILE" ./... 2>&1)
+EXIT=$?
+
+# --- Failures first ---
+
+FAIL_COUNT=$(echo "$OUTPUT" | grep -c '^FAIL' || true)
+if [ "$FAIL_COUNT" -gt 0 ]; then
+    echo "FAILURES:"
+    echo "$OUTPUT" | grep '^FAIL' | sed 's/^/  /'
+    echo ""
 fi
+
+# --- Per-package coverage table ---
+
+echo "Coverage by package:"
+echo ""
+printf "  %-42s %10s %8s\n" "Package" "Time" "Cover"
+printf "  %-42s %10s %8s\n" "---" "----" "-----"
+
+echo "$OUTPUT" | grep '^ok' | while IFS= read -r line; do
+    pkg=$(echo "$line" | awk '{print $2}')
+    short_pkg=${pkg#github.com/ha1tch/olu/}
+    timing=$(echo "$line" | awk '{print $3}')
+    cov=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+%' || echo "n/a")
+    printf "  %-42s %10s %8s\n" "$short_pkg" "$timing" "$cov"
+done
+
 echo ""
 
-# Race Detector
-if $RUN_RACE; then
-    print_header "Running Race Detector..."
-    if go test -race ./...; then
-        print_success "No race conditions detected"
-    else
-        print_error "Race conditions detected"
-        FAILED=true
-    fi
-    echo ""
+# --- Aggregate ---
+
+AGGREGATE="n/a"
+if [ -f "$COVERFILE" ]; then
+    AGGREGATE=$(go tool cover -func="$COVERFILE" 2>/dev/null | tail -1 | awk '{print $NF}')
 fi
 
-# Coverage
-if $RUN_COVERAGE; then
-    print_header "Generating Coverage Report..."
-    if go test -coverprofile=coverage.out ./...; then
-        go tool cover -html=coverage.out -o coverage.html
-        COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}')
-        print_success "Coverage report generated: coverage.html"
-        print_info "Total coverage: $COVERAGE"
-    else
-        print_error "Coverage generation failed"
-        FAILED=true
-    fi
-    echo ""
-fi
+PASS_COUNT=$(echo "$OUTPUT" | grep -c '^ok' || true)
+SKIP_LINE=$(echo "$OUTPUT" | grep -oE '[0-9]+ skip' | head -1 || true)
 
-# Benchmarks
-if $RUN_BENCHMARKS; then
-    print_header "Running Benchmarks..."
-    print_info "This may take a few minutes..."
-    if go test -bench=. -benchmem ./pkg/server/ > benchmark_results.txt; then
-        print_success "Benchmarks complete"
-        print_info "Results saved to benchmark_results.txt"
-        echo ""
-        echo -e "${YELLOW}Top 5 Operations by Speed:${NC}"
-        grep "Benchmark" benchmark_results.txt | head -5
-    else
-        print_error "Benchmarks failed"
-        FAILED=true
-    fi
-    echo ""
-fi
-
-# Summary
-echo -e "${BLUE}╔══════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║            Test Summary              ║${NC}"
-echo -e "${BLUE}╚══════════════════════════════════════╝${NC}"
+echo "Aggregate coverage: $AGGREGATE"
+echo "Packages:           $PASS_COUNT pass, $FAIL_COUNT fail"
 echo ""
 
-if $FAILED; then
-    print_error "Some tests failed"
-    exit 1
-else
-    print_success "All tests passed!"
+# --- HTML report ---
+
+if $HTML && [ -f "$COVERFILE" ]; then
+    go tool cover -html="$COVERFILE" -o coverage.html 2>/dev/null
+    echo "Reports: coverage.out, coverage.html"
     echo ""
-    print_info "Run with -h for more options"
 fi
 
-exit 0
+# --- Threshold gate ---
+
+if [ -n "$THRESHOLD" ] && [ -f "$COVERFILE" ]; then
+    ACTUAL=$(echo "$AGGREGATE" | tr -d '%')
+    PASS_GATE=$(echo "$ACTUAL >= $THRESHOLD" | bc -l 2>/dev/null || echo "0")
+    if [ "$PASS_GATE" -eq 1 ]; then
+        echo "Threshold: ${ACTUAL}% >= ${THRESHOLD}% (ok)"
+    else
+        echo "Threshold: ${ACTUAL}% < ${THRESHOLD}% (FAIL)"
+        exit 1
+    fi
+fi
+
+exit $EXIT

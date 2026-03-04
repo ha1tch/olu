@@ -1,3 +1,7 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package storage
 
 import (
@@ -12,10 +16,11 @@ import (
 
 // JSONFileStore implements Store interface using JSON files
 type JSONFileStore struct {
-	baseDir string
-	schema  string
-	idLocks map[string]*sync.Mutex
-	idMutex sync.RWMutex
+	baseDir     string
+	schema      string
+	idLocks     map[string]*sync.Mutex
+	idMutex     sync.RWMutex
+	storeConfig StoreConfig
 }
 
 // NewJSONFileStore creates a new JSON file-based storage
@@ -29,7 +34,17 @@ func NewJSONFileStore(baseDir, schema string) (*JSONFileStore, error) {
 		baseDir: baseDir,
 		schema:  schema,
 		idLocks: make(map[string]*sync.Mutex),
+		storeConfig: StoreConfig{
+			Type:    "jsonfile",
+			BaseDir: baseDir,
+			Schema:  schema,
+		},
 	}, nil
+}
+
+// Config returns the store's StoreConfig.
+func (s *JSONFileStore) Config() StoreConfig {
+	return s.storeConfig
 }
 
 // Info returns store information
@@ -59,6 +74,10 @@ func (s *JSONFileStore) getIDLock(entity string) *sync.Mutex {
 
 // GetEntityDir returns the directory path for an entity
 func (s *JSONFileStore) GetEntityDir(entity string) string {
+	if s.storeConfig.TenantID != 0 {
+		return filepath.Join(s.baseDir, s.schema,
+			fmt.Sprintf("t%04X", s.storeConfig.TenantID), entity)
+	}
 	return filepath.Join(s.baseDir, s.schema, entity)
 }
 
@@ -175,6 +194,13 @@ func (s *JSONFileStore) Update(ctx context.Context, entity string, id int, data 
 
 // Patch partially updates an entity
 func (s *JSONFileStore) Patch(ctx context.Context, entity string, id int, patchData map[string]interface{}) error {
+	return s.PatchValidated(ctx, entity, id, patchData, nil)
+}
+
+// PatchValidated merges patch data and optionally validates the merged result.
+// Note: JSONFileStore does not provide transactional isolation for Patch —
+// concurrent patches may still race. For production multi-tenant use, use SQLite.
+func (s *JSONFileStore) PatchValidated(ctx context.Context, entity string, id int, patchData map[string]interface{}, validate func(merged map[string]interface{}) error) error {
 	existing, err := s.Get(ctx, entity, id)
 	if err != nil {
 		return err
@@ -184,6 +210,12 @@ func (s *JSONFileStore) Patch(ctx context.Context, entity string, id int, patchD
 	for k, v := range patchData {
 		if k != "id" {
 			existing[k] = v
+		}
+	}
+
+	if validate != nil {
+		if err := validate(existing); err != nil {
+			return err
 		}
 	}
 	
@@ -265,6 +297,12 @@ func (s *JSONFileStore) Exists(ctx context.Context, entity string, id int) bool 
 	return err == nil
 }
 
+// Ping verifies that the storage directory is accessible.
+func (s *JSONFileStore) Ping(ctx context.Context) error {
+	_, err := os.Stat(s.baseDir)
+	return err
+}
+
 // Close closes the storage (cleanup if needed)
 func (s *JSONFileStore) Close() error {
 	return nil
@@ -273,6 +311,10 @@ func (s *JSONFileStore) Close() error {
 // ListEntities returns all entity types in the schema
 func (s *JSONFileStore) ListEntities(ctx context.Context) ([]string, error) {
 	schemaPath := filepath.Join(s.baseDir, s.schema)
+	if s.storeConfig.TenantID != 0 {
+		schemaPath = filepath.Join(s.baseDir, s.schema,
+			fmt.Sprintf("t%04X", s.storeConfig.TenantID))
+	}
 	
 	entries, err := os.ReadDir(schemaPath)
 	if err != nil {

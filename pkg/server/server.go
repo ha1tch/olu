@@ -1,26 +1,37 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package server
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/ha1tch/olu/pkg/cache"
 	"github.com/ha1tch/olu/pkg/config"
+	oluerr "github.com/ha1tch/olu/pkg/errors"
 	"github.com/ha1tch/olu/pkg/graph"
 	oluMiddleware "github.com/ha1tch/olu/pkg/middleware"
 	"github.com/ha1tch/olu/pkg/models"
 	"github.com/ha1tch/olu/pkg/oql"
 	"github.com/ha1tch/olu/pkg/storage"
 	"github.com/ha1tch/olu/pkg/sulpher"
+	"github.com/ha1tch/olu/pkg/tenant"
+	"github.com/ha1tch/olu/pkg/timeseries"
 	"github.com/ha1tch/olu/pkg/validation"
 	"github.com/ha1tch/olu/pkg/version"
 	"github.com/rs/zerolog"
@@ -29,35 +40,200 @@ import (
 // Context key type for tenant isolation
 type contextKey string
 
-const tenantContextKey contextKey = "tenant_id"
+const (
+	tenantContextKey contextKey = "tenant_id"
+	storeContextKey  contextKey = "tenant_store"
+)
 
 // Server represents the HTTP server
 type Server struct {
-	config      *config.Config
-	storage     storage.Store
-	cache       cache.Cache
-	graph       graph.Graph
-	persister   *graph.AdaptivePersister
-	validator   validation.Validator
-	sulpherJobs *sulpher.JobManager
-	oqlJobs     *oql.JobManager
-	rateLimiter *oluMiddleware.RateLimiter
-	metrics     *oluMiddleware.Metrics
-	logger      zerolog.Logger
-	router      *chi.Mux
+	config         *config.Config
+	storage        storage.Store
+	cache          cache.Cache
+	graph          graph.Graph
+	persister      *graph.AdaptivePersister
+	validator      validation.Validator
+	sulpherJobs    *sulpher.JobManager
+	oqlJobs        *oql.JobManager
+	rateLimiter    *oluMiddleware.RateLimiter
+	metrics        *oluMiddleware.Metrics
+	logger         zerolog.Logger
+	router         *chi.Mux
+	tenantRegistry *tenant.Registry
+	tsManager      *timeseries.DefaultManager // nil when timeseries disabled
+	tsRetention    *timeseries.RetentionWorker          // nil when retention disabled
+	httpServer     *http.Server
+	tenantStores   sync.Map // tenantID (uint16) -> storage.Store; avoids per-request sql.Open
+	ready          int32    // atomic: 0 = not ready, 1 = ready; set when Start() is called
 }
 
-// tenantMiddleware extracts tenant_id from URL and stores in context
+// storeForTenant returns a Store scoped to the given tenant ID.
+//
+// Each tenant store maintains its own connection pools against the shared
+// SQLite database: one writer (MaxOpenConns=1) and one reader pool
+// (MaxOpenConns=NumCPU by default). With N active tenants, total connections
+// are approximately N×(1+NumCPU). SQLite's WAL mode handles concurrent
+// readers well, but operators should be aware of the multiplication when
+// sizing file descriptor limits (ulimit -n) for high tenant counts.
+//
+// Stores are created lazily on first access and cached in a sync.Map.
+// The LoadOrStore pattern handles concurrent creation races safely.
+// For tenant 0, returns the default unscoped store.
+// For non-zero tenants, returns a cached store instance that shares
+
+// TenantRegistry returns the server's tenant registry. This is primarily
+// useful for pre-registering tenants in strict mode before starting the
+// server.
+func (s *Server) TenantRegistry() *tenant.Registry {
+	return s.tenantRegistry
+}
+// the same underlying database but scopes all queries. Stores are
+// created once per tenant and reused across requests, avoiding the
+// overhead of sql.Open on every request.
+func (s *Server) storeForTenant(tenantID uint16) (storage.Store, error) {
+	if tenantID == 0 {
+		return s.storage, nil
+	}
+
+	// Fast path: check cache
+	if cached, ok := s.tenantStores.Load(tenantID); ok {
+		return cached.(storage.Store), nil
+	}
+
+	// Slow path: create and cache
+	baseCfg := s.storage.Config()
+	store, err := storage.NewStoreFromConfig(storage.StoreConfig{
+		Type:                      baseCfg.Type,
+		DBPath:                    baseCfg.DBPath,
+		BaseDir:                   baseCfg.BaseDir,
+		Schema:                    baseCfg.Schema,
+		FullTextEnabled:           baseCfg.FullTextEnabled,
+		GraphEnabled:              baseCfg.GraphEnabled,
+		TenantID:                  tenantID,
+		SQLiteCacheSize:           baseCfg.SQLiteCacheSize,
+		SQLiteBusyTimeout:         baseCfg.SQLiteBusyTimeout,
+		SQLiteMaxOpenConns:        baseCfg.SQLiteMaxOpenConns,
+		SQLiteMaxIdleConns:        baseCfg.SQLiteMaxIdleConns,
+		SQLiteContentionThreshold: baseCfg.SQLiteContentionThreshold,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// LoadOrStore handles the race where two requests create the same tenant store
+	// concurrently: one wins, the other's store gets discarded (and closed).
+	actual, loaded := s.tenantStores.LoadOrStore(tenantID, store)
+	if loaded {
+		// Another goroutine won the race — close our duplicate and use theirs.
+		store.Close()
+		return actual.(storage.Store), nil
+	}
+	return store, nil
+}
+
+// getStore returns the tenant-scoped store from context, or the default
+// unscoped store if no tenant context is present. Handlers should use
+// this instead of s.storage directly.
+func (s *Server) getStore(ctx context.Context) storage.Store {
+	if v := ctx.Value(storeContextKey); v != nil {
+		return v.(storage.Store)
+	}
+	return s.storage
+}
+
+// getTenantIDNumeric returns the numeric tenant ID from context, or 0.
+func getTenantIDNumeric(ctx context.Context) uint16 {
+	if v := ctx.Value(storeContextKey); v != nil {
+		return v.(storage.Store).Config().TenantID
+	}
+	return 0
+}
+
+// tenantMiddleware resolves the tenant name from the URL, looks it up in the
+// registry, constructs a scoped store, and injects both into the context.
+//
+// Resolution order:
+//  1. Look up the URL parameter as a tenant name in the registry.
+//  2. If not found, try parsing it as a numeric tenant ID (uint16) and
+//     resolve the registered name via reverse lookup. This allows
+//     /tenant/1 as an alias for /tenant/acme when acme has ID 1.
+//  3. In path mode only, if neither lookup succeeds the name is
+//     auto-registered as a new tenant (existing behaviour).
 func (s *Server) tenantMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tenantID := chi.URLParam(r, "tenant_id")
-		if tenantID == "" {
-			s.writeError(w, http.StatusBadRequest, "tenant_id required")
+		tenantName := chi.URLParam(r, "tenant_id")
+		if tenantName == "" {
+			s.writeError(w, http.StatusBadRequest, oluerr.ErrMissingParam, "tenant_id required")
 			return
 		}
-		ctx := context.WithValue(r.Context(), tenantContextKey, tenantID)
+
+		var tid uint16
+		if s.config.TenantMode == "strict" {
+			// Strict mode: tenant must be pre-registered.
+			var ok bool
+			tid, ok = s.tenantRegistry.Lookup(tenantName)
+			if !ok {
+				// Numeric fallback: try parsing as a tenant ID.
+				tid, tenantName, ok = s.resolveNumericTenant(tenantName)
+				if !ok {
+					s.writeError(w, http.StatusNotFound, oluerr.ErrEntityNotFound,
+						fmt.Sprintf("Unknown tenant: %s", chi.URLParam(r, "tenant_id")))
+					return
+				}
+			}
+		} else {
+			// Non-strict (path) mode: check registry first, then
+			// numeric fallback, then optionally auto-register.
+			var ok bool
+			tid, ok = s.tenantRegistry.Lookup(tenantName)
+			if !ok {
+				if numTid, numName, numOK := s.resolveNumericTenant(tenantName); numOK {
+					tid, tenantName = numTid, numName
+				} else if s.config.TenantAutoRegister {
+					// Auto-register on first access (only when enabled).
+					var err error
+					tid, err = s.tenantRegistry.GetOrRegister(r.Context(), tenantName)
+					if err != nil {
+						s.writeError(w, http.StatusBadRequest, oluerr.ErrInvalidEntity,
+							fmt.Sprintf("Invalid tenant: %s", tenantName))
+						return
+					}
+				} else {
+					s.writeError(w, http.StatusNotFound, oluerr.ErrEntityNotFound,
+						fmt.Sprintf("Unknown tenant: %s (auto-registration disabled)", tenantName))
+					return
+				}
+			}
+		}
+
+		store, err := s.storeForTenant(tid)
+		if err != nil {
+			s.logger.Error().Err(err).Str("tenant", tenantName).Msg("Failed to create tenant store")
+			s.writeError(w, http.StatusInternalServerError, oluerr.ErrStorageFailed, "Failed to initialise tenant context")
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), tenantContextKey, tenantName)
+		ctx = context.WithValue(ctx, storeContextKey, store)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// resolveNumericTenant attempts to parse raw as a decimal uint16 and look up
+// the corresponding tenant name in the registry. Returns the tenant ID,
+// resolved name, and true on success. Returns zero values and false if raw
+// is not numeric, out of range, zero, or not registered.
+func (s *Server) resolveNumericTenant(raw string) (uint16, string, bool) {
+	n, err := strconv.ParseUint(raw, 10, 16)
+	if err != nil || n == 0 {
+		return 0, "", false
+	}
+	id := uint16(n)
+	name, ok := s.tenantRegistry.Name(id)
+	if !ok {
+		return 0, "", false
+	}
+	return id, name, ok
 }
 
 // tenantStrictMiddleware enforces tenant context in strict mode.
@@ -69,24 +245,30 @@ func (s *Server) tenantStrictMiddleware(next http.Handler) http.Handler {
 		path := r.URL.Path
 		
 		// Allow system endpoints
-		if path == "/health" || path == "/version" || path == "/metrics" {
+		if path == "/health" || path == "/ready" || path == "/version" || path == "/metrics" {
 			next.ServeHTTP(w, r)
 			return
 		}
 		
-		// Allow non-entity API endpoints (graph, oql, schema, export, search)
-		if strings.Contains(path, "/graph/") ||
-			strings.Contains(path, "/oql/") ||
-			strings.Contains(path, "/schema/") ||
-			strings.Contains(path, "/export") ||
-			strings.Contains(path, "/search") {
+		// Allow schema endpoints (tenant-independent)
+		if strings.HasPrefix(path, "/api/v1/schema/") || path == "/api/v1/schema" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Allow tenant-scoped routes (they have their own tenant extraction)
+		if strings.Contains(path, "/tenant/") {
 			next.ServeHTTP(w, r)
 			return
 		}
 		
-		// For entity routes, require tenant context
-		if strings.HasPrefix(path, "/api/v1/") && !strings.Contains(path, "/tenant/") {
-			s.writeError(w, http.StatusForbidden,
+		// Everything else under /api/v1/ requires tenant context in strict mode.
+		// Non-tenant OQL, search, export, and graph routes are not registered
+		// in strict mode (see setupRoutes), so they 404 naturally. But if
+		// an entity happens to be named "search" or "export", the wildcard
+		// /{entity} route would match — the middleware blocks it here.
+		if strings.HasPrefix(path, "/api/v1/") {
+			s.writeError(w, http.StatusForbidden, oluerr.ErrTenantRequired,
 				"Tenant context required. Use /api/v1/tenant/{tenant_id}/... routes")
 			return
 		}
@@ -95,12 +277,61 @@ func (s *Server) tenantStrictMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// getTenantID returns tenant_id from context, or empty string if not set
+// getTenantID returns the tenant name string from context, or empty string if not set.
+// Kept for backward compatibility with code that needs the string form.
 func getTenantID(ctx context.Context) string {
 	if v := ctx.Value(tenantContextKey); v != nil {
 		return v.(string)
 	}
 	return ""
+}
+
+// corsMiddleware returns a handler that sets CORS headers for the given origins.
+// It handles preflight OPTIONS requests and adds appropriate headers to all responses.
+//
+// SECURITY NOTE: This middleware sets Access-Control-Allow-Credentials: true,
+// which means cookies and HTTP auth headers are forwarded to the API by
+// browsers. When combined with a wildcard origin ("*"), this effectively
+// allows credentialed requests from any domain. This is acceptable when
+// authentication uses API keys or Bearer tokens (which are not sent
+// automatically by browsers), but becomes dangerous if cookie-based auth
+// is ever added. In that case, restrict CORSOrigins to specific domains.
+func corsMiddleware(origins []string) func(http.Handler) http.Handler {
+	originSet := make(map[string]bool, len(origins))
+	allowAll := false
+	for _, o := range origins {
+		if o == "*" {
+			allowAll = true
+		}
+		originSet[o] = true
+	}
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			if allowAll || originSet[origin] {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, X-API-Key, X-Request-ID")
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+				w.Header().Set("Access-Control-Max-Age", "300")
+				w.Header().Set("Vary", "Origin")
+			}
+
+			// Handle preflight
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // New creates a new server instance
@@ -114,14 +345,15 @@ func New(
 	logger zerolog.Logger,
 ) *Server {
 	s := &Server{
-		config:    cfg,
-		storage:   store,
-		cache:     cache,
-		graph:     g,
-		persister: persister,
-		validator: validator,
-		logger:    logger,
-		router:    chi.NewRouter(),
+		config:         cfg,
+		storage:        store,
+		cache:          cache,
+		graph:          g,
+		persister:      persister,
+		validator:      validator,
+		logger:         logger,
+		router:         chi.NewRouter(),
+		tenantRegistry: tenant.NewRegistry(),
 	}
 
 	// Initialize rate limiter if enabled
@@ -139,14 +371,92 @@ func New(
 		if ig, ok := g.(*graph.IndexedGraph); ok {
 			executor := sulpher.NewExecutor(ig, cfg.MaxQueryDepth)
 			s.sulpherJobs = sulpher.NewJobManager(executor, time.Duration(cfg.GraphQueryTTL)*time.Second)
+			s.sulpherJobs.SetLimits(sulpher.GraphLimits{
+				MaxVisitedNodes: cfg.GraphMaxVisitedNodes,
+				MaxResults:      cfg.GraphMaxResults,
+			})
+			if cfg.QueryTimeout > 0 {
+				s.sulpherJobs.SetQueryTimeout(time.Duration(cfg.QueryTimeout) * time.Second)
+			}
 		}
 	}
 
 	// Initialize OQL query engine with schema validation
 	oqlEngine := oql.NewEngineWithSchemaValidator(store, cfg.SchemaDir, validator)
+	oqlEngine.SetLimits(oql.QueryLimits{
+		MaxRows:     cfg.QueryMaxRows,
+		MaxScanRows: cfg.QueryMaxScanRows,
+	})
+
+	// Select hardware profile for query planner thresholds.
+	profileName := strings.ToLower(cfg.PerformanceProfile)
+	if profileName == "" {
+		profileName = "auto"
+	}
+	switch profileName {
+	case "auto":
+		// Run startup micro-benchmark to calibrate thresholds.
+		if sqlStore, ok := store.(*storage.SQLiteStore); ok {
+			profile, err := oql.Calibrate(sqlStore.DB())
+			if err != nil {
+				logger.Warn().Err(err).Msg("Hardware calibration failed, using VPS defaults")
+			} else {
+				oqlEngine.SetProfile(profile)
+			}
+		}
+	case "edge", "vps", "dedicated":
+		if profile := oql.ProfileByName(profileName); profile != nil {
+			oqlEngine.SetProfile(profile)
+			logger.Info().Str("profile", profileName).Msg("Using hardware profile")
+		}
+	default:
+		logger.Warn().Str("profile", cfg.PerformanceProfile).Msg("Unknown performance profile, using VPS defaults")
+	}
+
 	s.oqlJobs = oql.NewJobManager(oqlEngine, time.Duration(cfg.GraphQueryTTL)*time.Second)
+	if cfg.QueryTimeout > 0 {
+		s.oqlJobs.SetQueryTimeout(time.Duration(cfg.QueryTimeout) * time.Second)
+	}
+
+	// Attach tenant persistence if using SQLite storage.
+	// This ensures name-to-ID mappings are stable across restarts.
+	if cfg.StorageType == "sqlite" {
+		if sqlStore, ok := store.(*storage.SQLiteStore); ok {
+			tp := storage.NewSQLiteTenantPersister(sqlStore.DB(), sqlStore.ReaderDB())
+			s.tenantRegistry.SetPersister(tp)
+			if err := s.tenantRegistry.LoadFrom(context.Background()); err != nil {
+				logger.Error().Err(err).Msg("Failed to load tenant registry from database")
+			}
+		}
+	}
+
+	// Initialize timeseries manager if enabled
+	if cfg.TimeseriesEnabled {
+		tsBaseDir := filepath.Join(cfg.BaseDir, "ts")
+		tsCfg := timeseries.StoreConfig{
+			MemtableSize:          cfg.TSMemtableSize,
+			BlockSize:             cfg.TSBlockSize,
+			Compression:           cfg.TSCompression,
+			L0CompactionThreshold: cfg.TSL0CompactionThreshold,
+			MaxOpenFiles:          cfg.TSMaxOpenFiles,
+			DefaultRetentionDays:  cfg.TSDefaultRetentionDays,
+		}
+		tsm, err := timeseries.NewManager(tsBaseDir, timeseries.NewPebbleStoreFactory(), tsCfg)
+		if err != nil {
+			logger.Error().Err(err).Msg("Failed to initialise timeseries manager")
+		} else {
+			s.tsManager = tsm
+			if cfg.TSRetentionEnabled && cfg.TSCompactionIntervalSecs > 0 {
+				interval := time.Duration(cfg.TSCompactionIntervalSecs) * time.Second
+				w := timeseries.NewRetentionWorker(tsm, interval)
+				w.Start()
+				s.tsRetention = w
+			}
+		}
+	}
 
 	s.setupRoutes()
+	atomic.StoreInt32(&s.ready, 1)
 	return s
 }
 
@@ -156,7 +466,28 @@ func (s *Server) setupRoutes() {
 	s.router.Use(middleware.RealIP)
 	s.router.Use(middleware.Logger)
 	s.router.Use(middleware.Recoverer)
-	s.router.Use(middleware.Timeout(60 * time.Second))
+	reqTimeout := 60
+	if s.config.HTTPRequestTimeout > 0 {
+		reqTimeout = s.config.HTTPRequestTimeout
+	}
+	s.router.Use(middleware.Timeout(time.Duration(reqTimeout) * time.Second))
+
+	// Limit request body size to prevent abuse. Uses MaxEntitySize from config.
+	maxBody := int64(s.config.MaxEntitySize)
+	if maxBody <= 0 {
+		maxBody = 1 << 20 // 1MB fallback
+	}
+	s.router.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+			next.ServeHTTP(w, r)
+		})
+	})
+
+	// CORS middleware (before auth so preflight requests are handled)
+	if len(s.config.CORSOrigins) > 0 {
+		s.router.Use(corsMiddleware(s.config.CORSOrigins))
+	}
 
 	// Metrics middleware (before auth so we capture all requests)
 	if s.metrics != nil {
@@ -176,8 +507,9 @@ func (s *Server) setupRoutes() {
 		s.router.Use(s.tenantStrictMiddleware)
 	}
 
-	// Health check and metrics
+	// Health check, readiness, and metrics
 	s.router.Get("/health", s.handleHealth)
+	s.router.Get("/ready", s.handleReady)
 	s.router.Get("/version", s.handleVersion)
 	s.router.Get("/metrics", s.handleMetrics)
 
@@ -202,6 +534,38 @@ func (s *Server) setupRoutes() {
 			tr.Patch("/{entity}/{id}", s.handlePatch)
 			tr.Delete("/{entity}/{id}", s.handleDelete)
 			tr.Post("/{entity}/save/{id}", s.handleSave)
+
+			// Tenant-scoped search
+			tr.Get("/search", s.handleFullTextSearch)
+
+			// Tenant-scoped OQL queries
+			tr.Post("/oql/query", s.handleOQLQuery)
+			tr.Post("/oql/query/async", s.handleOQLQueryAsync)
+			tr.Get("/oql/query/{query_id}", s.handleOQLQueryStatus)
+			tr.Get("/oql/query/{query_id}/result", s.handleOQLQueryResult)
+
+			// Tenant-scoped timeseries routes
+			if s.tsManager != nil {
+				tr.Route("/ts", func(tsr chi.Router) {
+					tsr.Post("/provision", s.HandleTSProvision)
+					// Timeline management
+					tsr.Post("/timelines", s.HandleTSDefineTimeline)
+					tsr.Get("/timelines", s.HandleTSListTimelines)
+					tsr.Get("/timelines/{timeline_id}", s.HandleTSGetTimeline)
+					tsr.Patch("/timelines/{timeline_id}", s.HandleTSUpdateTimeline)
+					// Events
+					tsr.Post("/events", s.HandleTSAppend)
+					tsr.Post("/events/batch", s.HandleTSBatchAppend)
+					tsr.Get("/events", s.HandleTSQueryRange)
+					tsr.Get("/events/latest", s.HandleTSLatest)
+					// Aggregate
+					tsr.Post("/aggregate", s.HandleTSAggregate)
+					// Retention + stats
+					tsr.Get("/retention", s.HandleTSGetRetention)
+					tsr.Get("/stats", s.HandleTSStats)
+					tsr.Get("/stats/{timeline_id}", s.HandleTSTimelineStats)
+				})
+			}
 		})
 
 		// Graph operations
@@ -228,21 +592,25 @@ func (s *Server) setupRoutes() {
 			r.Get("/graph/query/{query_id}/result", s.handleSulpherQueryResult)
 		}
 
-		// OQL (SQL) query language endpoints
-		r.Post("/oql/query", s.handleOQLQuery)
-		r.Post("/oql/query/async", s.handleOQLQueryAsync)
-		r.Get("/oql/query/{query_id}", s.handleOQLQueryStatus)
-		r.Get("/oql/query/{query_id}/result", s.handleOQLQueryResult)
+		// Non-tenant routes: these operate against the default store (tenant 0).
+		// In strict mode they are disabled to prevent accidental unscoped queries.
+		if s.config.TenantMode != "strict" {
+			// OQL (SQL) query language endpoints (default store)
+			r.Post("/oql/query", s.handleOQLQuery)
+			r.Post("/oql/query/async", s.handleOQLQueryAsync)
+			r.Get("/oql/query/{query_id}", s.handleOQLQueryStatus)
+			r.Get("/oql/query/{query_id}/result", s.handleOQLQueryResult)
 
-		// Schema operations
+			// Search operations (default store)
+			r.Get("/search", s.handleFullTextSearch)
+
+			// Export operations (default store)
+			r.Get("/export", s.handleExport)
+		}
+
+		// Schema operations (tenant-independent, always available)
 		r.Post("/schema/{entity}", s.handleCreateSchema)
 		r.Get("/schema/{entity}", s.handleGetSchema)
-
-		// Export operations
-		r.Get("/export", s.handleExport)
-
-		// Search operations
-		r.Get("/search", s.handleFullTextSearch)
 	})
 }
 
@@ -250,7 +618,29 @@ func (s *Server) setupRoutes() {
 func (s *Server) Start() error {
 	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
 	s.logger.Info().Str("addr", addr).Msg("Starting server")
-	return http.ListenAndServe(addr, s.router)
+	s.httpServer = &http.Server{
+		Addr:    addr,
+		Handler: s.router,
+	}
+	if s.config.HTTPReadTimeout > 0 {
+		s.httpServer.ReadTimeout = time.Duration(s.config.HTTPReadTimeout) * time.Second
+	}
+	if s.config.HTTPWriteTimeout > 0 {
+		s.httpServer.WriteTimeout = time.Duration(s.config.HTTPWriteTimeout) * time.Second
+	}
+	if s.config.HTTPIdleTimeout > 0 {
+		s.httpServer.IdleTimeout = time.Duration(s.config.HTTPIdleTimeout) * time.Second
+	}
+	return s.httpServer.ListenAndServe()
+}
+
+// Shutdown gracefully shuts down the HTTP server, allowing in-flight
+// requests to complete within the given context deadline.
+func (s *Server) Shutdown(ctx context.Context) error {
+	if s.httpServer != nil {
+		return s.httpServer.Shutdown(ctx)
+	}
+	return nil
 }
 
 // Stop stops the server and cleans up resources
@@ -258,6 +648,24 @@ func (s *Server) Stop() {
 	if s.rateLimiter != nil {
 		s.rateLimiter.Stop()
 	}
+	// Stop retention worker before closing stores.
+	if s.tsRetention != nil {
+		s.tsRetention.Stop()
+	}
+	// Close timeseries stores before tenant stores.
+	if s.tsManager != nil {
+		if err := s.tsManager.Close(); err != nil {
+			s.logger.Error().Err(err).Msg("Failed to close timeseries manager")
+		}
+	}
+	// Close cached tenant stores
+	s.tenantStores.Range(func(key, value interface{}) bool {
+		if st, ok := value.(storage.Store); ok {
+			st.Close()
+		}
+		s.tenantStores.Delete(key)
+		return true
+	})
 }
 
 // Handler returns the HTTP handler (useful for testing)
@@ -265,8 +673,22 @@ func (s *Server) Handler() http.Handler {
 	return s.router
 }
 
-// handleHealth returns server health status
+// handleHealth returns server health status with database connectivity check.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+
+	if s.storage != nil {
+		if err := s.storage.Ping(ctx); err != nil {
+			s.writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+				"status":  "degraded",
+				"version": version.Version,
+				"db":      "unreachable",
+			})
+			return
+		}
+	}
+
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":  "ok",
 		"version": version.Version,
@@ -280,10 +702,46 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleReady returns readiness status for Kubernetes-style probes.
+// Returns 503 during server initialisation or when the database is
+// unreachable; returns 200 once the server is fully operational.
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if atomic.LoadInt32(&s.ready) == 0 {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"status": "initialising",
+		})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+
+	if s.storage != nil {
+		if err := s.storage.Ping(ctx); err != nil {
+			s.writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+				"status": "not_ready",
+				"db":     "unreachable",
+			})
+			return
+		}
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status": "ready",
+	})
+}
+
+// MarkReady sets the server as ready. This is called automatically by
+// Start(), but can be called manually in test setups that use
+// httptest.NewServer instead of Start().
+func (s *Server) MarkReady() {
+	atomic.StoreInt32(&s.ready, 1)
+}
+
 // handleMetrics returns Prometheus-format metrics
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if s.metrics == nil {
-		s.writeError(w, http.StatusServiceUnavailable, "Metrics not enabled")
+		s.writeError(w, http.StatusServiceUnavailable, oluerr.ErrSearchDisabled, "Metrics not enabled")
 		return
 	}
 
@@ -306,25 +764,23 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	entity := chi.URLParam(r, "entity")
 	if err := validateEntityName(entity); err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrInvalidEntity, err.Error())
 		return
 	}
 
 	var data map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
+	if !s.decodeJSON(w, r, &data) {
 		return
-	}
-
-	// Inject tenant_id if in tenant-scoped route
-	if tenantID := getTenantID(r.Context()); tenantID != "" {
-		data["tenant_id"] = tenantID
 	}
 
 	// Validate against schema
 	if valid, errors := s.validator.Validate(entity, data); !valid {
 		s.writeJSON(w, http.StatusBadRequest, map[string]interface{}{
-			"error":   "Validation failed",
+			"error": map[string]interface{}{
+				"code":    string(oluerr.ErrValidationFailed),
+				"message": "Validation failed",
+				"status":  http.StatusBadRequest,
+			},
 			"details": errors,
 		})
 		return
@@ -333,33 +789,27 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// Check size limit
 	jsonData, _ := json.Marshal(data)
 	if len(jsonData) > s.config.MaxEntitySize {
-		s.writeError(w, http.StatusRequestEntityTooLarge,
+		s.writeError(w, http.StatusRequestEntityTooLarge, oluerr.ErrEntityTooLarge,
 			fmt.Sprintf("Entity too large: %d bytes (max: %d)",
 				len(jsonData), s.config.MaxEntitySize))
 		return
 	}
 
-	// Create entity
-	id, err := s.storage.Create(r.Context(), entity, data)
+	// Create entity using tenant-scoped store
+	store := s.getStore(r.Context())
+	id, err := store.Create(r.Context(), entity, data)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("Failed to create entity")
-		s.writeError(w, http.StatusInternalServerError, "Failed to create entity")
+		s.writeError(w, http.StatusInternalServerError, oluerr.ErrStorageFailed, "Failed to create entity")
 		return
 	}
 
-	// Update graph if enabled
-	if s.config.GraphEnabled {
-		data["id"] = id
-		if err := s.graph.UpdateFromEntity(entity, id, data); err != nil {
-			s.logger.Error().Err(err).Msg("Failed to update graph")
-		}
-		if s.persister != nil {
-			s.persister.MarkDirty()
-		}
-	}
+	// Update graph
+	data["id"] = id
+	s.updateGraph(r.Context(), entity, id, data)
 
 	// Invalidate cache
-	s.invalidateCache(entity)
+	s.invalidateCacheForID(r.Context(), entity, id)
 
 	s.logger.Info().Str("entity", entity).Int("id", id).Msg("Created entity")
 
@@ -373,7 +823,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	entity := chi.URLParam(r, "entity")
 	if err := validateEntityName(entity); err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrInvalidEntity, err.Error())
 		return
 	}
 
@@ -393,23 +843,124 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	// Extract filter params (exclude pagination and system params)
 	filters := extractFilters(r.URL.Query())
 
-	// Add tenant_id filter if in tenant-scoped route
-	if tenantID := getTenantID(r.Context()); tenantID != "" {
-		filters["tenant_id"] = tenantID
-	}
-
-	// Build cache key including filters
+	// Build cache key including filters and tenant scope
+	tid := getTenantIDNumeric(r.Context())
 	cacheKey := buildListCacheKey(entity, page, perPage, filters)
+	if tid != 0 {
+		cacheKey = fmt.Sprintf("%04X:%s", tid, cacheKey)
+	}
 	if cached, err := s.cache.Get(r.Context(), cacheKey); err == nil {
 		s.writeJSON(w, http.StatusOK, cached)
 		return
 	}
 
-	// Get all entities
-	entities, err := s.storage.List(r.Context(), entity)
+	// Get all entities from tenant-scoped store
+	store := s.getStore(r.Context())
+
+	// Check if this entity uses adapted tables (column-per-field storage).
+	// Push-down generates SQL against the blob entities table, which doesn't
+	// contain adapted entity data, so we skip it for adapted entities and
+	// let the ListPaged or List paths handle them.
+	isAdapted := false
+	if sqlStore, ok := store.(*storage.SQLiteStore); ok {
+		if sqlStore.AdaptedRegistry().IsAdapted(entity) {
+			isAdapted = true
+		}
+	}
+
+	// Try push-down path: if the store supports Queryable, push WHERE + LIMIT
+	// to SQL rather than loading everything into Go memory.
+	if !isAdapted {
+	if qs, ok := store.(storage.Queryable); ok && qs.Capabilities().Where && qs.Capabilities().Limit {
+		result, totalItems, pushErr := s.listWithPushDown(r.Context(), qs, entity, page, perPage, filters)
+		if pushErr == nil {
+			totalPages := (totalItems + perPage - 1) / perPage
+
+			// Embed references if requested
+			embedParam := r.URL.Query().Get("embed")
+			if embedParam != "false" && embedParam != "0" {
+				embedDepth := 0
+				if depthParam := r.URL.Query().Get("embed_depth"); depthParam != "" {
+					if parsed, err := strconv.Atoi(depthParam); err == nil && parsed > 0 {
+						embedDepth = parsed
+					}
+				}
+				if embedDepth > s.config.MaxEmbedDepth {
+					embedDepth = s.config.MaxEmbedDepth
+				}
+				if embedDepth > 0 {
+					for i, item := range result {
+						result[i] = s.embedReferences(r.Context(), item, embedDepth)
+					}
+				}
+			}
+
+			response := models.PagedResponse{
+				Data: result,
+			}
+			response.Pagination.Page = page
+			response.Pagination.PerPage = perPage
+			response.Pagination.TotalItems = totalItems
+			response.Pagination.TotalPages = totalPages
+
+			_ = s.cache.Set(r.Context(), cacheKey, response, time.Duration(s.config.CacheTTL)*time.Second)
+			s.writeJSON(w, http.StatusOK, response)
+			return
+		}
+		// Push-down failed — fall through
+		s.logger.Debug().Err(pushErr).Msg("List push-down failed, falling back")
+	}
+	} // !isAdapted
+
+	// Try PagedLister path: storage-level LIMIT/OFFSET without filters.
+	// This avoids loading all records when only a page is needed.
+	if len(filters) == 0 {
+		if pl, ok := store.(storage.PagedLister); ok {
+			offset := (page - 1) * perPage
+			pr, plErr := pl.ListPaged(r.Context(), entity, perPage, offset)
+			if plErr == nil {
+				pageData := pr.Data
+				totalPages := (pr.TotalItems + perPage - 1) / perPage
+
+				// Embed references if requested
+				embedParam := r.URL.Query().Get("embed")
+				if embedParam != "false" && embedParam != "0" {
+					embedDepth := 0
+					if depthParam := r.URL.Query().Get("embed_depth"); depthParam != "" {
+						if parsed, err := strconv.Atoi(depthParam); err == nil && parsed > 0 {
+							embedDepth = parsed
+						}
+					}
+					if embedDepth > s.config.MaxEmbedDepth {
+						embedDepth = s.config.MaxEmbedDepth
+					}
+					if embedDepth > 0 {
+						for i, item := range pageData {
+							pageData[i] = s.embedReferences(r.Context(), item, embedDepth)
+						}
+					}
+				}
+
+				response := models.PagedResponse{
+					Data: pageData,
+				}
+				response.Pagination.Page = page
+				response.Pagination.PerPage = perPage
+				response.Pagination.TotalItems = pr.TotalItems
+				response.Pagination.TotalPages = totalPages
+
+				_ = s.cache.Set(r.Context(), cacheKey, response, time.Duration(s.config.CacheTTL)*time.Second)
+				s.writeJSON(w, http.StatusOK, response)
+				return
+			}
+			s.logger.Debug().Err(plErr).Msg("ListPaged failed, falling back to full List")
+		}
+	}
+
+	entities, err := store.List(r.Context(), entity)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("Failed to list entities")
-		s.writeError(w, http.StatusInternalServerError, "Failed to list entities")
+		s.writeError(w, http.StatusInternalServerError, oluerr.ErrStorageFailed, "Failed to list entities")
 		return
 	}
 
@@ -474,18 +1025,19 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	idStr := chi.URLParam(r, "id")
 
 	if err := validateEntityName(entity); err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrInvalidEntity, err.Error())
 		return
 	}
 
 	id, err := strconv.Atoi(idStr)
 	if err != nil || id < 0 {
-		s.writeError(w, http.StatusBadRequest, "Invalid ID")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrInvalidID, "Invalid ID")
 		return
 	}
 
 	// Check cache for raw entity data
-	cacheKey := fmt.Sprintf("%s:%d", entity, id)
+	tid := getTenantIDNumeric(r.Context())
+	cacheKey := tenant.CacheKey(tid, entity, id)
 	var data map[string]interface{}
 
 	if cached, err := s.cache.Get(r.Context(), cacheKey); err == nil {
@@ -500,31 +1052,23 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if data == nil {
-		// Cache miss - fetch from storage
+		// Cache miss - fetch from tenant-scoped store
+		store := s.getStore(r.Context())
 		var err error
-		data, err = s.storage.Get(r.Context(), entity, id)
+		data, err = store.Get(r.Context(), entity, id)
 		if err != nil {
-			if strings.Contains(err.Error(), "not found") {
-				s.writeError(w, http.StatusNotFound,
+			if errors.Is(err, storage.ErrNotFound) {
+				s.writeError(w, http.StatusNotFound, oluerr.ErrEntityNotFound,
 					fmt.Sprintf("Resource of entity %s with id %d not found", entity, id))
 				return
 			}
 			s.logger.Error().Err(err).Msg("Failed to get entity")
-			s.writeError(w, http.StatusInternalServerError, "Failed to get entity")
+			s.writeError(w, http.StatusInternalServerError, oluerr.ErrStorageFailed, "Failed to get entity")
 			return
 		}
 
 		// Cache the raw data
 		_ = s.cache.Set(r.Context(), cacheKey, data, time.Duration(s.config.CacheTTL)*time.Second)
-	}
-
-	// Verify tenant access if in tenant-scoped route
-	if tenantID := getTenantID(r.Context()); tenantID != "" {
-		if !matchesTenant(data, tenantID) {
-			s.writeError(w, http.StatusNotFound,
-				fmt.Sprintf("Resource of entity %s with id %d not found", entity, id))
-			return
-		}
 	}
 
 	// Embed references
@@ -557,76 +1101,57 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	idStr := chi.URLParam(r, "id")
 
 	if err := validateEntityName(entity); err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrInvalidEntity, err.Error())
 		return
 	}
 
 	id, err := strconv.Atoi(idStr)
 	if err != nil || id < 0 {
-		s.writeError(w, http.StatusBadRequest, "Invalid ID")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrInvalidID, "Invalid ID")
 		return
 	}
 
 	var data map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
+	if !s.decodeJSON(w, r, &data) {
 		return
-	}
-
-	// Verify tenant access and inject tenant_id if in tenant-scoped route
-	if tenantID := getTenantID(r.Context()); tenantID != "" {
-		existing, err := s.storage.Get(r.Context(), entity, id)
-		if err != nil {
-			if strings.Contains(err.Error(), "not found") {
-				s.writeError(w, http.StatusNotFound,
-					fmt.Sprintf("Resource of entity %s with id %d not found", entity, id))
-				return
-			}
-			s.logger.Error().Err(err).Msg("Failed to get entity for tenant check")
-			s.writeError(w, http.StatusInternalServerError, "Failed to update entity")
-			return
-		}
-		if !matchesTenant(existing, tenantID) {
-			s.writeError(w, http.StatusNotFound,
-				fmt.Sprintf("Resource of entity %s with id %d not found", entity, id))
-			return
-		}
-		data["tenant_id"] = tenantID
 	}
 
 	// Validate
 	data["id"] = id
 	if valid, errors := s.validator.Validate(entity, data); !valid {
 		s.writeJSON(w, http.StatusBadRequest, map[string]interface{}{
-			"error":   "Validation failed",
+			"error": map[string]interface{}{
+				"code":    string(oluerr.ErrValidationFailed),
+				"message": "Validation failed",
+				"status":  http.StatusBadRequest,
+			},
 			"details": errors,
 		})
 		return
 	}
 
-	// Update
-	if err := s.storage.Update(r.Context(), entity, id, data); err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			s.writeError(w, http.StatusNotFound,
+	// Update using tenant-scoped store
+	store := s.getStore(r.Context())
+	if err := store.Update(r.Context(), entity, id, data); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			s.writeError(w, http.StatusNotFound, oluerr.ErrEntityNotFound,
 				fmt.Sprintf("Resource of entity %s with id %d not found", entity, id))
 			return
 		}
+		if errors.Is(err, storage.ErrConflict) {
+			s.writeError(w, http.StatusConflict, oluerr.ErrVersionConflict,
+				fmt.Sprintf("Version conflict: %s with id %d has been modified by another request", entity, id))
+			return
+		}
 		s.logger.Error().Err(err).Msg("Failed to update entity")
-		s.writeError(w, http.StatusInternalServerError, "Failed to update entity")
+		s.writeError(w, http.StatusInternalServerError, oluerr.ErrStorageFailed, "Failed to update entity")
 		return
 	}
 
 	// Update graph
-	if s.config.GraphEnabled {
-		if err := s.graph.UpdateFromEntity(entity, id, data); err != nil {
-			s.logger.Error().Err(err).Msg("Failed to update graph")
-		}
-		if s.persister != nil {
-			s.persister.MarkDirty()
-		}
-	}
+	s.updateGraph(r.Context(), entity, id, data)
 
-	s.invalidateCache(entity)
+	s.invalidateCache(r.Context(), entity)
 	s.logger.Info().Str("entity", entity).Int("id", id).Msg("Updated entity")
 
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -646,11 +1171,80 @@ var reservedQueryParams = map[string]bool{
 }
 
 // extractFilters extracts filter parameters from query string
+// listWithPushDown generates a SQL query for the list endpoint and executes it
+// via the Queryable interface. Returns the page of results and total item count.
+// Filters are translated to json_extract WHERE clauses; pagination uses LIMIT/OFFSET.
+func (s *Server) listWithPushDown(ctx context.Context, qs storage.Queryable, entity string, page, perPage int, filters map[string]string) ([]map[string]interface{}, int, error) {
+	tid := int(getTenantIDNumeric(ctx))
+
+	// Build filter WHERE clauses (sorted for deterministic queries)
+	var filterClauses []string
+	var filterArgs []interface{}
+	for field, value := range filters {
+		if err := validateFieldName(field); err != nil {
+			return nil, 0, fmt.Errorf("invalid filter: %w", err)
+		}
+		filterClauses = append(filterClauses, fmt.Sprintf("json_extract(data, '$.%s') = ?", field))
+		filterArgs = append(filterArgs, value)
+	}
+	sort.Strings(filterClauses)
+
+	filterSQL := ""
+	if len(filterClauses) > 0 {
+		filterSQL = " AND " + strings.Join(filterClauses, " AND ")
+	}
+
+	// Step 1: Get total count. Use CountEntities for unfiltered, or a
+	// lightweight count query wrapped as JSON for filtered requests so
+	// it can pass through QueryWithPlan's (data, _version) scan.
+	var totalItems int
+	if len(filters) == 0 {
+		count, err := qs.CountEntities(ctx, entity)
+		if err != nil {
+			return nil, 0, fmt.Errorf("count: %w", err)
+		}
+		totalItems = count
+	} else {
+		// Filtered count: synthesise a JSON blob so QueryWithPlan can scan it.
+		cntSQL := `SELECT '{"c":' || COUNT(*) || '}' AS data, 0 AS _version FROM entities WHERE tenant_id = ? AND entity_type = ?` + filterSQL
+		cntArgs := append([]interface{}{tid, entity}, filterArgs...)
+		cntRows, err := qs.QueryWithPlan(ctx, cntSQL, cntArgs)
+		if err != nil {
+			return nil, 0, fmt.Errorf("filtered count: %w", err)
+		}
+		if len(cntRows) > 0 {
+			if c, ok := cntRows[0]["c"].(float64); ok {
+				totalItems = int(c)
+			}
+		}
+	}
+
+	if totalItems == 0 {
+		return []map[string]interface{}{}, 0, nil
+	}
+
+	// Step 2: Fetch the page.
+	offset := (page - 1) * perPage
+	dataSQL := "SELECT data, _version FROM entities WHERE tenant_id = ? AND entity_type = ?" + filterSQL + " ORDER BY id LIMIT ? OFFSET ?"
+	dataArgs := append([]interface{}{tid, entity}, filterArgs...)
+	dataArgs = append(dataArgs, perPage, offset)
+
+	rows, err := qs.QueryWithPlan(ctx, dataSQL, dataArgs)
+	if err != nil {
+		return nil, 0, fmt.Errorf("data query: %w", err)
+	}
+
+	return rows, totalItems, nil
+}
+
 func extractFilters(query url.Values) map[string]string {
 	filters := make(map[string]string)
 	for key, values := range query {
 		if reservedQueryParams[key] {
 			continue
+		}
+		if validateFieldName(key) != nil {
+			continue // silently skip invalid field names
 		}
 		if len(values) > 0 && values[0] != "" {
 			filters[key] = values[0]
@@ -730,29 +1324,80 @@ func matchesFilters(entity map[string]interface{}, filters map[string]string) bo
 	return true
 }
 
-// matchesTenant checks if an entity belongs to the specified tenant
-func matchesTenant(entity map[string]interface{}, tenantID string) bool {
-	value, exists := entity["tenant_id"]
-	if !exists {
-		return false
+// updateGraph updates the in-memory graph with tenant-scoped node IDs.
+// For tenant 0 (unscoped), node IDs are "entity:id".
+// For non-zero tenants, node IDs are "XXXX/entity:id".
+func (s *Server) updateGraph(ctx context.Context, entityType string, id int, data map[string]interface{}) {
+	if !s.config.GraphEnabled || s.graph == nil {
+		return
 	}
 
-	// Convert value to string for comparison
-	var actual string
-	switch v := value.(type) {
-	case string:
-		actual = v
-	case float64:
-		if v == float64(int(v)) {
-			actual = strconv.Itoa(int(v))
-		} else {
-			actual = strconv.FormatFloat(v, 'f', -1, 64)
+	tid := getTenantIDNumeric(ctx)
+	nodeID := tenant.NodeID(tid, entityType, id)
+
+	// Add/update the node
+	nodeType, _ := data["type"].(string)
+	if err := s.graph.AddNode(nodeID, nodeType); err != nil {
+		s.logger.Error().Err(err).Str("node", nodeID).Msg("Failed to add graph node")
+		return
+	}
+
+	// Remove all existing outgoing edges before re-adding from current data.
+	// The entity store is the source of truth for REF fields; the graph is a
+	// derived index and must reflect the current state after every write.
+	if existing, err := s.graph.GetNeighbors(nodeID); err == nil {
+		for target := range existing {
+			if err := s.graph.RemoveEdge(nodeID, target); err != nil {
+				s.logger.Error().Err(err).
+					Str("from", nodeID).Str("to", target).
+					Msg("Failed to remove stale graph edge")
+			}
 		}
-	case int:
-		actual = strconv.Itoa(v)
-	default:
-		actual = fmt.Sprintf("%v", v)
 	}
 
-	return actual == tenantID
+	// Extract REF fields and add edges with tenant-scoped target IDs
+	for key, value := range data {
+		if key == "id" {
+			continue
+		}
+		valueMap, ok := value.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		refType, _ := valueMap["type"].(string)
+		if refType != "REF" {
+			continue
+		}
+		targetEntity, _ := valueMap["entity"].(string)
+		targetIDFloat, _ := valueMap["id"].(float64)
+		targetID := int(targetIDFloat)
+		if targetEntity == "" || targetID == 0 {
+			continue
+		}
+		targetNodeID := tenant.NodeID(tid, targetEntity, targetID)
+		if err := s.graph.AddEdge(nodeID, targetNodeID, key); err != nil {
+			s.logger.Error().Err(err).
+				Str("from", nodeID).Str("to", targetNodeID).
+				Msg("Failed to add graph edge")
+		}
+	}
+
+	if s.persister != nil {
+		s.persister.MarkDirty()
+	}
+}
+
+// removeGraph removes a node and its edges from the in-memory graph.
+func (s *Server) removeGraph(ctx context.Context, entityType string, id int) {
+	if !s.config.GraphEnabled || s.graph == nil {
+		return
+	}
+	tid := getTenantIDNumeric(ctx)
+	nodeID := tenant.NodeID(tid, entityType, id)
+	if err := s.graph.RemoveNode(nodeID); err != nil {
+		s.logger.Error().Err(err).Str("node", nodeID).Msg("Failed to remove graph node")
+	}
+	if s.persister != nil {
+		s.persister.MarkDirty()
+	}
 }

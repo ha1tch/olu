@@ -45,8 +45,9 @@ set_version() {
     local new_version="$1"
     
     # Validate version format (basic semver)
-    if ! echo "$new_version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-        echo "Error: Invalid version format. Expected X.Y.Z (e.g., 0.7.3)" >&2
+    if ! echo "$new_version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+        echo "Error: Invalid version format. Expected X.Y.Z or X.Y.Z-suffix (e.g., 0.7.3, 0.9.4-rc1)" >&2
+        # Note: suffix is freeform (rc1, rc2, alpha, checkpoint, etc.) -- no canonicality enforced
         exit 1
     fi
     

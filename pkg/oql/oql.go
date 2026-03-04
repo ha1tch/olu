@@ -1,3 +1,7 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 // Package oql provides SQL-compatible query language for olu.
 //
 // OQL supports a subset of T-SQL syntax for querying and mutating data:
@@ -17,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/ha1tch/tsqlparser"
 	"github.com/ha1tch/tsqlparser/ast"
 	"github.com/ha1tch/olu/pkg/storage"
@@ -36,20 +41,51 @@ type Engine struct {
 	mu              sync.RWMutex
 }
 
+// SetLimits configures query execution limits for this engine.
+func (e *Engine) SetLimits(limits QueryLimits) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.executor.SetLimits(limits)
+}
+
+// SetProfile updates the hardware profile used by the query planner.
+// Call this during server startup after calibration or profile selection.
+func (e *Engine) SetProfile(profile *HardwareProfile) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.executor.SetProfile(profile)
+}
+
 // NewEngine creates a new OQL engine
 func NewEngine(store storage.Store, schemaDir string) *Engine {
+	// Check if store supports entity listing
+	var validator *Validator
+	if checker, ok := store.(EntityChecker); ok {
+		validator = NewValidatorWithStore(schemaDir, checker)
+	} else {
+		validator = NewValidator(schemaDir)
+	}
+	
 	return &Engine{
 		store:     store,
-		validator: NewValidator(schemaDir),
+		validator: validator,
 		executor:  NewExecutor(store, nil),
 	}
 }
 
 // NewEngineWithSchemaValidator creates an OQL engine with schema validation
 func NewEngineWithSchemaValidator(store storage.Store, schemaDir string, sv SchemaValidator) *Engine {
+	// Check if store supports entity listing
+	var validator *Validator
+	if checker, ok := store.(EntityChecker); ok {
+		validator = NewValidatorWithStore(schemaDir, checker)
+	} else {
+		validator = NewValidator(schemaDir)
+	}
+	
 	return &Engine{
 		store:           store,
-		validator:       NewValidator(schemaDir),
+		validator:       validator,
 		executor:        NewExecutor(store, sv),
 		schemaValidator: sv,
 	}
@@ -57,6 +93,13 @@ func NewEngineWithSchemaValidator(store storage.Store, schemaDir string, sv Sche
 
 // Execute parses, validates, and executes an OQL query
 func (e *Engine) Execute(ctx context.Context, sql string) (*Result, error) {
+	return e.ExecuteWithTenant(ctx, sql, "")
+}
+
+// ExecuteWithTenant parses, validates, and executes an OQL query scoped to a tenant.
+// When tenantID is non-empty, all operations are filtered to the specified tenant.
+// Deprecated: Use ExecuteWithStore for new code.
+func (e *Engine) ExecuteWithTenant(ctx context.Context, sql string, tenantID string) (*Result, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
@@ -71,8 +114,26 @@ func (e *Engine) Execute(ctx context.Context, sql string) (*Result, error) {
 		return nil, err
 	}
 
-	// 3. Execute
-	return e.executor.Execute(ctx, stmt)
+	// 3. Execute with tenant scoping
+	return e.executor.ExecuteWithTenant(ctx, stmt, tenantID)
+}
+
+// ExecuteWithStore parses, validates, and executes an OQL query using a specific store.
+// The store should already be scoped to the target tenant.
+func (e *Engine) ExecuteWithStore(ctx context.Context, sql string, store storage.Store) (*Result, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	stmt, err := e.parse(sql)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := e.validator.Validate(stmt); err != nil {
+		return nil, err
+	}
+
+	return e.executor.ExecuteWithStore(ctx, stmt, store)
 }
 
 // parse parses a SQL string into an AST statement
@@ -109,6 +170,7 @@ type Job struct {
 	Error     string
 	CreatedAt time.Time
 	UpdatedAt time.Time
+	store     storage.Store // tenant-scoped store captured at submission time (unexported)
 }
 
 // JobStatus represents the status of a job
@@ -123,27 +185,38 @@ const (
 
 // JobManager manages async OQL query jobs
 type JobManager struct {
-	engine  *Engine
-	jobs    map[string]*Job
-	mu      sync.RWMutex
-	ttl     time.Duration
-	closeCh chan struct{}
+	engine       *Engine
+	jobs         map[string]*Job
+	mu           sync.RWMutex
+	ttl          time.Duration
+	queryTimeout time.Duration
+	closeCh      chan struct{}
 }
 
 // NewJobManager creates a new job manager
 func NewJobManager(engine *Engine, ttl time.Duration) *JobManager {
 	jm := &JobManager{
-		engine:  engine,
-		jobs:    make(map[string]*Job),
-		ttl:     ttl,
-		closeCh: make(chan struct{}),
+		engine:       engine,
+		jobs:         make(map[string]*Job),
+		ttl:          ttl,
+		queryTimeout: 5 * time.Minute, // default; override via SetQueryTimeout
+		closeCh:      make(chan struct{}),
 	}
 	go jm.cleanupLoop()
 	return jm
 }
 
-// Submit submits a query for async execution
-func (jm *JobManager) Submit(query string) string {
+// SetQueryTimeout sets the maximum execution time for async queries.
+func (jm *JobManager) SetQueryTimeout(d time.Duration) {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+	jm.queryTimeout = d
+}
+
+// Submit submits a query for async execution using the provided store.
+// The store is captured at submission time so the background goroutine
+// executes against the correct tenant scope.
+func (jm *JobManager) Submit(query string, store storage.Store) string {
 	jm.mu.Lock()
 	defer jm.mu.Unlock()
 
@@ -154,6 +227,7 @@ func (jm *JobManager) Submit(query string) string {
 		Status:    JobPending,
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
+		store:     store,
 	}
 	jm.jobs[id] = job
 
@@ -166,6 +240,17 @@ func (jm *JobManager) Submit(query string) string {
 // ExecuteSync executes a query synchronously
 func (jm *JobManager) ExecuteSync(ctx context.Context, query string) (*Result, error) {
 	return jm.engine.Execute(ctx, query)
+}
+
+// ExecuteSyncWithTenant executes a query synchronously scoped to a tenant
+// Deprecated: Use ExecuteSyncWithStore for new code.
+func (jm *JobManager) ExecuteSyncWithTenant(ctx context.Context, query string, tenantID string) (*Result, error) {
+	return jm.engine.ExecuteWithTenant(ctx, query, tenantID)
+}
+
+// ExecuteSyncWithStore executes a query synchronously using a specific store.
+func (jm *JobManager) ExecuteSyncWithStore(ctx context.Context, query string, store storage.Store) (*Result, error) {
+	return jm.engine.ExecuteWithStore(ctx, query, store)
 }
 
 // GetJob returns a job by ID
@@ -202,8 +287,19 @@ func (jm *JobManager) executeJob(job *Job) {
 	job.UpdatedAt = time.Now()
 	jm.mu.Unlock()
 
-	ctx := context.Background()
-	result, err := jm.engine.Execute(ctx, job.Query)
+	ctx, cancel := context.WithTimeout(context.Background(), jm.queryTimeout)
+	defer cancel()
+
+	// Use the tenant-scoped store captured at submission time.
+	// Falls back to the engine's default store if none was provided
+	// (e.g. for non-tenant routes or admin queries).
+	var result *Result
+	var err error
+	if job.store != nil {
+		result, err = jm.engine.ExecuteWithStore(ctx, job.Query, job.store)
+	} else {
+		result, err = jm.engine.Execute(ctx, job.Query)
+	}
 
 	jm.mu.Lock()
 	defer jm.mu.Unlock()
@@ -251,5 +347,5 @@ func (jm *JobManager) Close() {
 
 // generateJobID creates a unique job ID
 func generateJobID() string {
-	return fmt.Sprintf("oql_%d", time.Now().UnixNano())
+	return "oql_" + uuid.New().String()
 }

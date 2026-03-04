@@ -2,7 +2,9 @@
 
 ## Overview
 
-olu v0.8.0 provides a graph layer for navigating relationships between entities. The graph is automatically maintained when entities with REF fields are created, updated, or deleted.
+olu provides a graph layer for navigating relationships between entities. The graph is automatically maintained when entities with REF fields are created, updated, or deleted.
+
+**Important:** Graph features are only available in single-tenant mode (`OLU_TENANT_MODE=path`). In strict (multi-tenant) mode, graph is automatically disabled because the in-memory graph structure is not yet tenant-isolated. This is enforced at config validation time.
 
 **Query Languages:**
 

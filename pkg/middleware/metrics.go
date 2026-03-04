@@ -1,3 +1,7 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package middleware
 
 import (
@@ -259,6 +263,8 @@ func (m *Metrics) GetSnapshot() MetricsSnapshot {
 		RequestErrors:  atomic.LoadUint64(&m.requestErrors),
 		ActiveRequests: atomic.LoadInt64(&m.activeRequests),
 		LatencyAvgMs:   avgLatency,
+		LatencySumSec:  float64(atomic.LoadUint64(&m.latencySum)) / 1e6, // microseconds -> seconds
+		LatencyCount:   latencyCount,
 		LatencyBuckets: buckets,
 		EntityCreates:  atomic.LoadUint64(&m.entityCreates),
 		EntityReads:    atomic.LoadUint64(&m.entityReads),
@@ -282,6 +288,8 @@ type MetricsSnapshot struct {
 	RequestErrors  uint64
 	ActiveRequests int64
 	LatencyAvgMs   float64
+	LatencySumSec  float64           // total latency in seconds (for Prometheus _sum)
+	LatencyCount   uint64            // total observations (for Prometheus _count)
 	LatencyBuckets map[string]uint64
 	EntityCreates  uint64
 	EntityReads    uint64
@@ -338,6 +346,8 @@ func (m *Metrics) PrometheusFormat() string {
 		cumulative += snapshot.LatencyBuckets[bucket]
 		result += "olu_request_duration_seconds_bucket{le=\"" + bucket + "\"} " + strconv.FormatUint(cumulative, 10) + "\n"
 	}
+	result += "olu_request_duration_seconds_sum " + strconv.FormatFloat(snapshot.LatencySumSec, 'f', 6, 64) + "\n"
+	result += "olu_request_duration_seconds_count " + strconv.FormatUint(snapshot.LatencyCount, 10) + "\n"
 	result += "\n"
 
 	// Average latency

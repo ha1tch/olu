@@ -1,7 +1,10 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package storage
 
 import (
-	"context"
 	"fmt"
 	"sync"
 )
@@ -44,6 +47,39 @@ func ListStores() []string {
 		stores = append(stores, name)
 	}
 	return stores
+}
+
+// NewStoreFromConfig creates a store directly from a StoreConfig.
+// This is the preferred constructor for tenant-scoped stores.
+func NewStoreFromConfig(cfg StoreConfig) (Store, error) {
+	switch cfg.Type {
+	case "sqlite":
+		return NewSQLiteStore(cfg.DBPath, SQLiteConfig{
+			DBPath:              cfg.DBPath,
+			EnableWAL:           true,
+			EnableForeignKeys:   true,
+			CacheSize:           cfg.SQLiteCacheSize,
+			BusyTimeout:         cfg.SQLiteBusyTimeout,
+			FullTextEnabled:     cfg.FullTextEnabled,
+			GraphEnabled:        cfg.GraphEnabled,
+			TenantID:            cfg.TenantID,
+			MaxOpenConns:        cfg.SQLiteMaxOpenConns,
+			MaxIdleConns:        cfg.SQLiteMaxIdleConns,
+			ReadPoolSize:        cfg.SQLiteReadPoolSize,
+			ContentionThreshold: cfg.SQLiteContentionThreshold,
+		})
+	case "jsonfile":
+		store, err := NewJSONFileStore(cfg.BaseDir, cfg.Schema)
+		if err != nil {
+			return nil, err
+		}
+		store.storeConfig.TenantID = cfg.TenantID
+		store.storeConfig.FullTextEnabled = cfg.FullTextEnabled
+		store.storeConfig.GraphEnabled = cfg.GraphEnabled
+		return store, nil
+	default:
+		return nil, fmt.Errorf("unknown store type: %s", cfg.Type)
+	}
 }
 
 // init registers built-in stores
@@ -100,90 +136,3 @@ func init() {
 	})
 }
 
-// Helper functions for common operations
-
-// WithTransaction executes a function within a transaction if the store supports it
-func WithTransaction(ctx context.Context, store Store, fn func(Transaction) error) error {
-	if ts, ok := store.(Transactional); ok {
-		tx, err := ts.Begin(ctx)
-		if err != nil {
-			return err
-		}
-		
-		defer func() {
-			if r := recover(); r != nil {
-				_ = tx.Rollback()
-				panic(r)
-			}
-		}()
-		
-		if err := fn(tx); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-		
-		return tx.Commit()
-	}
-	
-	// If store doesn't support transactions, execute directly
-	// Note: This creates a pseudo-transaction that can't rollback
-	pseudoTx := &pseudoTransaction{store: store}
-	return fn(pseudoTx)
-}
-
-// pseudoTransaction wraps a non-transactional store
-type pseudoTransaction struct {
-	store Store
-}
-
-func (pt *pseudoTransaction) Create(ctx context.Context, entity string, data map[string]interface{}) (int, error) {
-	return pt.store.Create(ctx, entity, data)
-}
-
-func (pt *pseudoTransaction) Get(ctx context.Context, entity string, id int) (map[string]interface{}, error) {
-	return pt.store.Get(ctx, entity, id)
-}
-
-func (pt *pseudoTransaction) Update(ctx context.Context, entity string, id int, data map[string]interface{}) error {
-	return pt.store.Update(ctx, entity, id, data)
-}
-
-func (pt *pseudoTransaction) Patch(ctx context.Context, entity string, id int, data map[string]interface{}) error {
-	return pt.store.Patch(ctx, entity, id, data)
-}
-
-func (pt *pseudoTransaction) Delete(ctx context.Context, entity string, id int) error {
-	return pt.store.Delete(ctx, entity, id)
-}
-
-func (pt *pseudoTransaction) Save(ctx context.Context, entity string, id int, data map[string]interface{}) error {
-	return pt.store.Save(ctx, entity, id, data)
-}
-
-func (pt *pseudoTransaction) List(ctx context.Context, entity string) ([]map[string]interface{}, error) {
-	return pt.store.List(ctx, entity)
-}
-
-func (pt *pseudoTransaction) Exists(ctx context.Context, entity string, id int) bool {
-	return pt.store.Exists(ctx, entity, id)
-}
-
-func (pt *pseudoTransaction) Search(ctx context.Context, entity string, field string, query string, matchType string) ([]map[string]interface{}, error) {
-	return pt.store.Search(ctx, entity, field, query, matchType)
-}
-
-func (pt *pseudoTransaction) FullTextSearch(ctx context.Context, query string, entity string) ([]map[string]interface{}, error) {
-	return pt.store.FullTextSearch(ctx, query, entity)
-}
-
-func (pt *pseudoTransaction) Close() error {
-	return nil
-}
-
-func (pt *pseudoTransaction) Commit() error {
-	return nil
-}
-
-func (pt *pseudoTransaction) Rollback() error {
-	return nil
-}

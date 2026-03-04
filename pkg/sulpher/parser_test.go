@@ -1,3 +1,7 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package sulpher
 
 import (
@@ -5,6 +9,7 @@ import (
 )
 
 func TestParserSimpleQuery(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	// Test: Simple node query
@@ -35,6 +40,7 @@ func TestParserSimpleQuery(t *testing.T) {
 }
 
 func TestParserWithInlineProperties(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User {id: 123, active: true}) RETURN u")
@@ -52,6 +58,7 @@ func TestParserWithInlineProperties(t *testing.T) {
 }
 
 func TestParserSingleHop(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User)-[r:FOLLOWS]->(f:User) RETURN f")
@@ -86,6 +93,7 @@ func TestParserSingleHop(t *testing.T) {
 }
 
 func TestParserMultiHop(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User)-[:FOLLOWS]->(f:User)-[:LIKES]->(p:Post) RETURN p")
@@ -111,6 +119,7 @@ func TestParserMultiHop(t *testing.T) {
 }
 
 func TestParserWithWhere(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User)-[:FOLLOWS]->(f:User) WHERE u.id = 123 RETURN f")
@@ -135,6 +144,7 @@ func TestParserWithWhere(t *testing.T) {
 }
 
 func TestParserWithMultipleConditions(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User) WHERE u.age >= 18 AND u.active = true RETURN u")
@@ -156,6 +166,7 @@ func TestParserWithMultipleConditions(t *testing.T) {
 }
 
 func TestParserDFS(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("DFS MATCH (u:User)-[:FOLLOWS]->(f) RETURN f")
@@ -169,6 +180,7 @@ func TestParserDFS(t *testing.T) {
 }
 
 func TestParserReturnProperties(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User)-[r:MANAGES]->(e:Employee) RETURN u.name, e.email, r")
@@ -197,6 +209,7 @@ func TestParserReturnProperties(t *testing.T) {
 }
 
 func TestParserInvalidQueries(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	invalidQueries := []string{
@@ -216,6 +229,7 @@ func TestParserInvalidQueries(t *testing.T) {
 }
 
 func TestParserCaseInsensitive(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	// Keywords should be case-insensitive
@@ -238,6 +252,7 @@ func TestParserCaseInsensitive(t *testing.T) {
 // Variable-length path tests
 
 func TestParserVariableLengthMinMax(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User)-[:FOLLOWS*1..5]->(f:User) RETURN f")
@@ -261,6 +276,7 @@ func TestParserVariableLengthMinMax(t *testing.T) {
 }
 
 func TestParserVariableLengthMaxOnly(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User)-[:FOLLOWS*..3]->(f:User) RETURN f")
@@ -281,6 +297,7 @@ func TestParserVariableLengthMaxOnly(t *testing.T) {
 }
 
 func TestParserVariableLengthMinOnly(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User)-[:FOLLOWS*2..]->(f:User) RETURN f")
@@ -301,6 +318,7 @@ func TestParserVariableLengthMinOnly(t *testing.T) {
 }
 
 func TestParserVariableLengthUnlimited(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User)-[:FOLLOWS*]->(f:User) RETURN f")
@@ -321,6 +339,7 @@ func TestParserVariableLengthUnlimited(t *testing.T) {
 }
 
 func TestParserVariableLengthExact(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User)-[:FOLLOWS*3]->(f:User) RETURN f")
@@ -341,6 +360,7 @@ func TestParserVariableLengthExact(t *testing.T) {
 }
 
 func TestParserVariableLengthWithVariable(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User)-[r:FOLLOWS*1..5]->(f:User) RETURN f")
@@ -361,6 +381,7 @@ func TestParserVariableLengthWithVariable(t *testing.T) {
 }
 
 func TestParserVariableLengthNoType(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User)-[*1..3]->(f:User) RETURN f")
@@ -381,6 +402,7 @@ func TestParserVariableLengthNoType(t *testing.T) {
 }
 
 func TestParserVariableLengthInvalid(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	invalidQueries := []string{
@@ -400,6 +422,7 @@ func TestParserVariableLengthInvalid(t *testing.T) {
 // Phase 4 tests: DISTINCT, LIMIT, ORDER BY, OR, bidirectional
 
 func TestParserDistinct(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User)-[:FOLLOWS]->(f:User) RETURN DISTINCT f")
@@ -413,6 +436,7 @@ func TestParserDistinct(t *testing.T) {
 }
 
 func TestParserLimit(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User) RETURN u LIMIT 10")
@@ -426,6 +450,7 @@ func TestParserLimit(t *testing.T) {
 }
 
 func TestParserOrderBy(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User) RETURN u ORDER BY u.name")
@@ -447,6 +472,7 @@ func TestParserOrderBy(t *testing.T) {
 }
 
 func TestParserOrderByDesc(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User) RETURN u ORDER BY u.age DESC")
@@ -460,6 +486,7 @@ func TestParserOrderByDesc(t *testing.T) {
 }
 
 func TestParserOrderByMultiple(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User) RETURN u ORDER BY u.name ASC, u.age DESC")
@@ -481,6 +508,7 @@ func TestParserOrderByMultiple(t *testing.T) {
 }
 
 func TestParserCombinedClauses(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User) RETURN DISTINCT u ORDER BY u.name LIMIT 5")
@@ -500,6 +528,7 @@ func TestParserCombinedClauses(t *testing.T) {
 }
 
 func TestParserWhereOr(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User) WHERE u.name = 'Alice' OR u.name = 'Bob' RETURN u")
@@ -513,6 +542,7 @@ func TestParserWhereOr(t *testing.T) {
 }
 
 func TestParserWhereAndOr(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	// (a AND b) OR (c AND d)
@@ -535,6 +565,7 @@ func TestParserWhereAndOr(t *testing.T) {
 }
 
 func TestParserBidirectionalUndirected(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User)-[r:KNOWS]-(f:User) RETURN f")
@@ -548,6 +579,7 @@ func TestParserBidirectionalUndirected(t *testing.T) {
 }
 
 func TestParserIncoming(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User)<-[r:FOLLOWS]-(f:User) RETURN f")
@@ -561,6 +593,7 @@ func TestParserIncoming(t *testing.T) {
 }
 
 func TestParserBidirectionalBothArrows(t *testing.T) {
+	t.Parallel()
 	parser := NewParser()
 
 	query, err := parser.Parse("MATCH (u:User)<-[r:KNOWS]->(f:User) RETURN f")

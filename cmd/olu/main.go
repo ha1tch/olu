@@ -1,8 +1,13 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package main
 
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -42,6 +47,19 @@ func main() {
 	// Load configuration
 	cfg := config.Default()
 	config.LoadFromEnv(cfg)
+
+	// Validate configuration
+	if errs, warnings := cfg.Validate(); len(errs) > 0 || len(warnings) > 0 {
+		for _, w := range warnings {
+			logger.Warn().Str("config", w).Msg("Configuration warning")
+		}
+		if len(errs) > 0 {
+			for _, e := range errs {
+				logger.Error().Str("config", e).Msg("Configuration error")
+			}
+			logger.Fatal().Int("errors", len(errs)).Msg("Invalid configuration; exiting")
+		}
+	}
 	
 	// Print banner
 	printBanner(cfg, logger)
@@ -55,21 +73,20 @@ func main() {
 	}
 	
 	// Initialize storage
-	var storeConfig map[string]interface{}
-	
-	if cfg.StorageType == "sqlite" {
-		storeConfig = map[string]interface{}{
-			"db_path":           cfg.DBPath,
-			"full_text_enabled": cfg.FullTextEnabled,
-		}
-	} else {
-		storeConfig = map[string]interface{}{
-			"base_dir": cfg.BaseDir,
-			"schema":   cfg.Schema,
-		}
-	}
-	
-	store, err := storage.NewStore(cfg.StorageType, storeConfig)
+	store, err := storage.NewStoreFromConfig(storage.StoreConfig{
+		Type:                      cfg.StorageType,
+		DBPath:                    cfg.DBPath,
+		BaseDir:                   cfg.BaseDir,
+		Schema:                    cfg.Schema,
+		FullTextEnabled:           cfg.FullTextEnabled,
+		GraphEnabled:              cfg.GraphEnabled,
+		SQLiteCacheSize:           cfg.SQLiteCacheSize,
+		SQLiteBusyTimeout:         cfg.SQLiteBusyTimeout,
+		SQLiteMaxOpenConns:        cfg.SQLiteMaxOpenConns,
+		SQLiteMaxIdleConns:        cfg.SQLiteMaxIdleConns,
+		SQLiteReadPoolSize:        cfg.SQLiteReadPoolSize,
+		SQLiteContentionThreshold: cfg.SQLiteContentionThreshold,
+	})
 	if err != nil {
 		logger.Fatal().Err(err).Msg("Failed to initialize storage")
 	}
@@ -94,16 +111,18 @@ func main() {
 			cfg.RedisHost,
 			cfg.RedisPort,
 			time.Duration(cfg.CacheTTL)*time.Second,
+			cfg.RedisPoolSize,
+			cfg.RedisMinIdleConns,
 		)
 		if err != nil {
 			logger.Warn().Err(err).Msg("Failed to connect to Redis, falling back to memory cache")
-			cacheInstance = cache.NewMemoryCache(cfg.CacheSize, time.Duration(cfg.CacheTTL)*time.Second)
+			cacheInstance = cache.NewShardedMemoryCache(cfg.CacheSize, time.Duration(cfg.CacheTTL)*time.Second, cfg.CacheShards)
 		} else {
 			cacheInstance = redisCache
 			logger.Info().Msg("Using Redis cache")
 		}
 	} else {
-		cacheInstance = cache.NewMemoryCache(cfg.CacheSize, time.Duration(cfg.CacheTTL)*time.Second)
+		cacheInstance = cache.NewShardedMemoryCache(cfg.CacheSize, time.Duration(cfg.CacheTTL)*time.Second, cfg.CacheShards)
 		logger.Info().Msg("Using in-memory cache")
 	}
 	defer cacheInstance.Close()
@@ -141,6 +160,24 @@ func main() {
 	if err := validator.LoadAllSchemas(); err != nil {
 		logger.Warn().Err(err).Msg("Failed to load schemas")
 	}
+
+	// Sync adapted tables: for every loaded schema, ensure an adapted
+	// table exists. This handles schemas added to the directory while
+	// the server was down. RegisterAdaptedEntity is idempotent — it
+	// skips tables whose schema hash hasn't changed.
+	if sqlStore, ok := store.(*storage.SQLiteStore); ok {
+		syncCtx, syncCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		for _, entity := range validator.LoadedEntities() {
+			raw, err := validator.GetSchema(entity)
+			if err != nil {
+				continue
+			}
+			if err := sqlStore.RegisterAdaptedEntity(syncCtx, entity, raw); err != nil {
+				logger.Warn().Err(err).Str("entity", entity).Msg("Failed to register adapted table at startup")
+			}
+		}
+		syncCancel()
+	}
 	
 	// Create server
 	srv := server.New(cfg, store, cacheInstance, graphInstance, persister, validator, logger)
@@ -148,24 +185,38 @@ func main() {
 	// Setup graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	
+
 	go func() {
 		<-sigChan
 		logger.Info().Msg("Shutting down gracefully...")
-		
+
+		// Give in-flight requests up to 15 seconds to complete
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		// Shut down HTTP server first (stops accepting new requests,
+		// waits for in-flight requests to finish)
+		if err := srv.Shutdown(ctx); err != nil {
+			logger.Error().Err(err).Msg("HTTP server shutdown error")
+		}
+
 		// Stop persister (triggers final save)
 		if persister != nil {
 			persister.Stop()
 		}
-		
-		os.Exit(0)
+
+		// Stop rate limiter cleanup
+		srv.Stop()
 	}()
-	
-	// Start server
+
+	// Start server (blocks until Shutdown is called or a fatal error occurs)
 	logger.Info().Msg("Server ready to accept requests")
-	if err := srv.Start(); err != nil {
+	if err := srv.Start(); err != nil && err != http.ErrServerClosed {
 		logger.Fatal().Err(err).Msg("Server failed")
 	}
+
+	// After Shutdown, main returns and defers execute (store.Close, cache.Close)
+	logger.Info().Msg("Server stopped")
 }
 
 func printBanner(cfg *config.Config, logger zerolog.Logger) {
@@ -236,7 +287,8 @@ func loadEntitiesIntoGraph(
 	g graph.Graph,
 	logger zerolog.Logger,
 ) error {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	schemaPath := filepath.Join(cfg.BaseDir, cfg.Schema)
 	
 	entries, err := os.ReadDir(schemaPath)

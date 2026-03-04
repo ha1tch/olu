@@ -1,9 +1,14 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package middleware
 
 import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -53,8 +58,17 @@ func AuthMiddleware(cfg *config.Config) func(http.Handler) http.Handler {
 				subject, authenticated = validateAPIKey(r, cfg)
 				authMethod = "apikey"
 			default:
-				// Unknown auth type, allow through (fail open for backwards compat)
-				next.ServeHTTP(w, r)
+				// Unknown auth type — refuse to serve. Config validation
+				// should prevent this, but defence in depth.
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"error": map[string]interface{}{
+						"code":    "OLU-CF001",
+						"message": "server misconfiguration: unknown auth type",
+						"status":  http.StatusInternalServerError,
+					},
+				})
 				return
 			}
 
@@ -195,7 +209,7 @@ func validateAPIKey(r *http.Request, cfg *config.Config) (string, bool) {
 
 	// Validate against configured keys
 	for _, validKey := range cfg.APIKeys {
-		if validKey != "" && apiKey == validKey {
+		if validKey != "" && subtle.ConstantTimeCompare([]byte(apiKey), []byte(validKey)) == 1 {
 			// Use key prefix as subject (first 8 chars)
 			subject := apiKey
 			if len(subject) > 8 {
@@ -221,8 +235,11 @@ func writeAuthError(w http.ResponseWriter, authType string) {
 
 	w.WriteHeader(http.StatusUnauthorized)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"error":   "Unauthorized",
-		"message": "Authentication required",
+		"error": map[string]interface{}{
+			"code":    "OLU-AU001",
+			"message": "Authentication required",
+			"status":  http.StatusUnauthorized,
+		},
 	})
 }
 

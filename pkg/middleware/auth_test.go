@@ -1,3 +1,7 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package middleware
 
 import (
@@ -371,5 +375,86 @@ func TestRateLimitMiddleware_ExcludedPath(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Errorf("Request %d to /health: expected 200, got %d", i+1, rec.Code)
 		}
+	}
+}
+
+func TestAuthMiddleware_UnknownAuthType_Returns500(t *testing.T) {
+	cfg := config.Default()
+	cfg.AuthType = "bogus" // not "none", "jwt", or "apikey"
+
+	handler := AuthMiddleware(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("Handler should not have been called — unknown auth type should fail closed")
+	}))
+
+	req := httptest.NewRequest("GET", "/api/v1/test", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("Expected 500 for unknown auth type, got %d", rec.Code)
+	}
+
+	// Verify structured error envelope
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("Response is not valid JSON: %v", err)
+	}
+	errObj, ok := body["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected nested error object, got %T: %v", body["error"], body["error"])
+	}
+	if errObj["code"] != "OLU-CF001" {
+		t.Errorf("Expected error code OLU-CF001, got %v", errObj["code"])
+	}
+}
+
+func TestRateLimitMiddleware_ErrorEnvelope(t *testing.T) {
+	cfg := config.Default()
+	cfg.RateLimitEnabled = true
+	cfg.RateLimitRate = 1
+	cfg.RateLimitWindow = 60
+	cfg.RateLimitByIP = true
+
+	limiter := NewRateLimiter(cfg)
+	defer limiter.Stop()
+
+	handler := RateLimitMiddleware(cfg, limiter)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Exhaust the rate limit
+	req := httptest.NewRequest("GET", "/api/v1/test", nil)
+	req.RemoteAddr = "10.0.0.1:9999"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req) // uses the one allowed request
+
+	// This request should be rate-limited
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("Expected 429, got %d", rec.Code)
+	}
+
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("Response is not valid JSON: %v", err)
+	}
+
+	// Verify nested error envelope
+	errObj, ok := body["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected nested error object, got %T: %v", body["error"], body["error"])
+	}
+	if errObj["code"] != "OLU-RL001" {
+		t.Errorf("Expected error code OLU-RL001, got %v", errObj["code"])
+	}
+
+	// Verify retry_after is a sibling, not inside the error object
+	if _, ok := body["retry_after"]; !ok {
+		t.Error("Expected retry_after as sibling of error object")
+	}
+	if _, ok := errObj["retry_after"]; ok {
+		t.Error("retry_after should not be inside the error object")
 	}
 }

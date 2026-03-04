@@ -1,8 +1,13 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package oql
 
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/ha1tch/tsqlparser/ast"
@@ -32,11 +37,17 @@ func aggCount(values []interface{}) interface{} {
 }
 
 func aggSum(values []interface{}) interface{} {
+	// SQL standard: SUM over empty set is NULL
+	hasValue := false
 	var sum float64
 	for _, v := range values {
 		if v != nil {
 			sum += toFloat(v)
+			hasValue = true
 		}
+	}
+	if !hasValue {
+		return nil
 	}
 	return sum
 }
@@ -152,17 +163,43 @@ func toFloatSafe(v interface{}) (float64, bool) {
 		return val, true
 	case float32:
 		return float64(val), true
+	case string:
+		f, err := strconv.ParseFloat(val, 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
 	default:
 		return 0, false
 	}
 }
 
 // Aggregator handles GROUP BY and aggregate function execution
-type Aggregator struct{}
+type Aggregator struct {
+	// decimalFields is the set of field names that should use
+	// decimal-precise aggregation instead of float64. Set via
+	// SetDecimalFields before calling Aggregate.
+	decimalFields map[string]bool
+}
 
 // NewAggregator creates a new aggregator
 func NewAggregator() *Aggregator {
 	return &Aggregator{}
+}
+
+// SetDecimalFields configures which fields should use decimal-precise
+// aggregation. Call this before Aggregate when adapted table metadata
+// indicates decimal columns.
+func (a *Aggregator) SetDecimalFields(fields map[string]bool) {
+	a.decimalFields = fields
+}
+
+// isDecimalField checks if a field name should use decimal aggregation.
+func (a *Aggregator) isDecimalField(fieldName string) bool {
+	if a.decimalFields == nil {
+		return false
+	}
+	return a.decimalFields[fieldName]
 }
 
 // Aggregate groups records and applies aggregate functions
@@ -189,6 +226,16 @@ func (a *Aggregator) Aggregate(
 		groups[key] = append(groups[key], rec)
 	}
 
+	// SQL standard: aggregate queries without GROUP BY always produce exactly
+	// one row, even when the input set is empty. The implicit single group
+	// must exist so that COUNT(*) returns 0, SUM/AVG/MIN/MAX return NULL.
+	// With GROUP BY, zero input rows correctly produces zero output rows
+	// (no groups formed).
+	if len(groupBy) == 0 && len(groupOrder) == 0 && hasAggregates(columns) {
+		groupOrder = append(groupOrder, "")
+		groups[""] = nil // empty group — aggregate functions receive empty slices
+	}
+
 	// Apply aggregates to each group
 	var results []map[string]interface{}
 	for _, key := range groupOrder {
@@ -213,6 +260,16 @@ func (a *Aggregator) Aggregate(
 						}
 					} else if len(fc.Arguments) > 0 {
 						values = a.extractColumnValues(groupRecords, fc.Arguments[0])
+
+						// Use decimal-precise aggregation if the field is decimal
+						if funcName != "COUNT" {
+							argName := exprToString(fc.Arguments[0])
+							if a.isDecimalField(argName) {
+								if decFn, ok := DecimalAggregates[funcName]; ok {
+									aggFn = decFn
+								}
+							}
+						}
 					}
 					result := aggFn(values)
 					row[alias] = result
@@ -263,6 +320,12 @@ func (a *Aggregator) extractColumnValues(records []map[string]interface{}, expr 
 		values[i] = getFieldValue(rec, colName)
 	}
 	return values
+}
+
+// EvalCondition evaluates a HAVING condition against a row.
+// Exported for use by aggregate push-down HAVING filter.
+func (a *Aggregator) EvalCondition(row map[string]interface{}, expr ast.Expression) bool {
+	return a.evalCondition(row, expr)
 }
 
 // evalCondition evaluates a HAVING condition

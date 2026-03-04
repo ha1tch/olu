@@ -1,3 +1,7 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package cache
 
 import (
@@ -114,12 +118,20 @@ type RedisCache struct {
 	ttl    time.Duration
 }
 
-// NewRedisCache creates a new Redis cache
-func NewRedisCache(host string, port int, ttl time.Duration) (*RedisCache, error) {
+// NewRedisCache creates a new Redis cache.
+// poolSize and minIdleConns control the connection pool; zero values use
+// defaults of 50 and 10 respectively.
+func NewRedisCache(host string, port int, ttl time.Duration, poolSize int, minIdleConns int) (*RedisCache, error) {
+	if poolSize <= 0 {
+		poolSize = 50
+	}
+	if minIdleConns <= 0 {
+		minIdleConns = 10
+	}
 	client := redis.NewClient(&redis.Options{
 		Addr:         fmt.Sprintf("%s:%d", host, port),
-		PoolSize:     50,
-		MinIdleConns: 10,
+		PoolSize:     poolSize,
+		MinIdleConns: minIdleConns,
 	})
 	
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -1,3 +1,7 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package storage_test
 
 import (
@@ -345,7 +349,9 @@ func TestSQLiteStore_PatchRemoveField(t *testing.T) {
 		t.Fatalf("Create failed: %v", err)
 	}
 
-	// Remove field by setting to nil
+	// Patch with nil sets the field to null (JSON null).
+	// Key deletion is handled at the handler level via PatchValidated
+	// with a validate callback that removes nil keys.
 	err = store.Patch(ctx, "users", id, map[string]interface{}{
 		"email": nil,
 	})
@@ -353,7 +359,7 @@ func TestSQLiteStore_PatchRemoveField(t *testing.T) {
 		t.Fatalf("Patch failed: %v", err)
 	}
 
-	// Verify field was removed
+	// Verify field is set to nil (not removed)
 	retrieved, err := store.Get(ctx, "users", id)
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
@@ -361,8 +367,35 @@ func TestSQLiteStore_PatchRemoveField(t *testing.T) {
 	if retrieved["name"] != "Alice" {
 		t.Errorf("Expected name Alice, got %v", retrieved["name"])
 	}
+	// email key should still exist but be nil (JSON null)
+	if _, hasEmail := retrieved["email"]; !hasEmail {
+		t.Error("Expected email field to be present (as null)")
+	}
+	if retrieved["email"] != nil {
+		t.Errorf("Expected email to be nil, got %v", retrieved["email"])
+	}
+
+	// Test PatchValidated with key deletion callback
+	err = store.PatchValidated(ctx, "users", id, map[string]interface{}{
+		"name": "Bob",
+	}, func(merged map[string]interface{}) error {
+		// Simulate PatchNullBehavior=delete by removing the nil email
+		delete(merged, "email")
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("PatchValidated failed: %v", err)
+	}
+
+	retrieved, err = store.Get(ctx, "users", id)
+	if err != nil {
+		t.Fatalf("Get after PatchValidated failed: %v", err)
+	}
+	if retrieved["name"] != "Bob" {
+		t.Errorf("Expected name Bob, got %v", retrieved["name"])
+	}
 	if _, hasEmail := retrieved["email"]; hasEmail {
-		t.Error("Expected email field to be removed")
+		t.Error("Expected email field to be removed by PatchValidated callback")
 	}
 }
 
@@ -600,10 +633,7 @@ func TestSQLiteStore_Search(t *testing.T) {
 	store.Create(ctx, "users", map[string]interface{}{"name": "Charlie", "age": 35})
 	store.Create(ctx, "users", map[string]interface{}{"name": "Alicia", "age": 28})
 
-	searcher, ok := store.(storage.Searcher)
-	if !ok {
-		t.Skip("Store does not implement Searcher interface")
-	}
+	searcher := store.(storage.Searcher) // compile-time: SQLiteStore implements Searcher
 
 	// Exact match
 	results, err := searcher.Search(ctx, "users", "name", "Alice", "exact")
@@ -742,10 +772,7 @@ func TestSQLiteStore_GetNeighbors(t *testing.T) {
 		},
 	})
 
-	graphStore, ok := store.(storage.GraphNeighbors)
-	if !ok {
-		t.Skip("Store does not implement GraphNeighbors interface")
-	}
+	graphStore := store.(storage.GraphNeighbors) // compile-time: SQLiteStore implements GraphNeighbors
 
 	// Get incoming edges (employees who report to this manager)
 	neighbors, err := graphStore.GetNeighbors(ctx, "users", managerId, "in")
@@ -786,10 +813,7 @@ func TestSQLiteStore_VerifyGraphIntegrity(t *testing.T) {
 	})
 
 	// Test GraphIntegrity interface
-	integrityStore, ok := store.(storage.GraphIntegrity)
-	if !ok {
-		t.Skip("Store does not implement GraphIntegrity interface")
-	}
+	integrityStore := store.(storage.GraphIntegrity) // compile-time: SQLiteStore implements GraphIntegrity
 
 	// Verify integrity
 	err := integrityStore.VerifyGraphIntegrity(ctx)
@@ -815,10 +839,7 @@ func TestSQLiteStore_RebuildGraph(t *testing.T) {
 		},
 	})
 
-	integrityStore, ok := store.(storage.GraphIntegrity)
-	if !ok {
-		t.Skip("Store does not implement GraphIntegrity interface")
-	}
+	integrityStore := store.(storage.GraphIntegrity) // compile-time: SQLiteStore implements GraphIntegrity
 	graphStore := store.(storage.GraphNeighbors)
 
 	// Verify graph works before rebuild
@@ -965,10 +986,7 @@ func TestSQLiteStore_Info(t *testing.T) {
 	store, cleanup := setupSQLiteTest(t)
 	defer cleanup()
 
-	infoProvider, ok := store.(storage.InfoProvider)
-	if !ok {
-		t.Skip("Store does not implement InfoProvider interface")
-	}
+	infoProvider := store.(storage.InfoProvider) // compile-time: SQLiteStore implements InfoProvider
 
 	info := infoProvider.Info()
 	if info.Type != "sqlite" {

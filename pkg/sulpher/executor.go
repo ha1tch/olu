@@ -1,7 +1,13 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package sulpher
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -9,6 +15,12 @@ import (
 	"time"
 
 	"github.com/ha1tch/olu/pkg/graph"
+)
+
+// Sentinel errors for graph query limit violations.
+var (
+	ErrVisitedNodeLimit = errors.New("graph visited node limit exceeded")
+	ErrResultLimit      = errors.New("graph result limit exceeded")
 )
 
 // QueryResult represents the result of a query execution
@@ -28,7 +40,14 @@ type QueryStats struct {
 type Executor struct {
 	graph    *graph.IndexedGraph
 	maxDepth int
+	limits   GraphLimits
 	mu       sync.RWMutex
+}
+
+// GraphLimits holds server-enforced limits for graph query execution.
+type GraphLimits struct {
+	MaxVisitedNodes int // Max nodes visited during traversal (0 = default 10000)
+	MaxResults      int // Max result paths returned (0 = no limit)
 }
 
 // NewExecutor creates a new query executor
@@ -39,8 +58,17 @@ func NewExecutor(g *graph.IndexedGraph, maxDepth int) *Executor {
 	}
 }
 
-// Execute runs a parsed query and returns results
-func (e *Executor) Execute(query *Query) (*QueryResult, error) {
+// SetLimits configures graph query execution limits.
+func (e *Executor) SetLimits(limits GraphLimits) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.limits = limits
+}
+
+// Execute runs a parsed query and returns results.
+// The context is checked during traversal; if cancelled, the query
+// stops and returns an error rather than continuing to consume resources.
+func (e *Executor) Execute(ctx context.Context, query *Query) (*QueryResult, error) {
 	startTime := time.Now()
 	stats := QueryStats{}
 
@@ -55,13 +83,37 @@ func (e *Executor) Execute(query *Query) (*QueryResult, error) {
 
 	var allPaths [][]pathNode
 	for _, startNode := range startNodes {
+		// Check context before each start node
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("graph query cancelled: %w", err)
+		}
 		var paths [][]pathNode
 		if query.Algorithm == DFS {
-			paths = e.dfsTraverse(snapshot, startNode, query.Path, &stats)
+			paths = e.dfsTraverse(ctx, snapshot, startNode, query.Path, &stats)
 		} else {
-			paths = e.bfsTraverse(snapshot, startNode, query.Path, &stats)
+			paths = e.bfsTraverse(ctx, snapshot, startNode, query.Path, &stats)
 		}
 		allPaths = append(allPaths, paths...)
+	}
+
+	// Check if traversal hit the visited-node limit
+	maxVisited := e.limits.MaxVisitedNodes
+	if maxVisited <= 0 {
+		maxVisited = 10000
+	}
+	if stats.NodesTraversed >= maxVisited {
+		return nil, fmt.Errorf("%w: visited %d nodes (max %d)", ErrVisitedNodeLimit, stats.NodesTraversed, maxVisited)
+	}
+
+	// Enforce result limit before expensive post-processing
+	maxResults := e.limits.MaxResults
+	if maxResults > 0 && len(allPaths) > maxResults {
+		return nil, fmt.Errorf("%w: %d paths (max %d)", ErrResultLimit, len(allPaths), maxResults)
+	}
+
+	// Check context after traversal
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("graph query cancelled: %w", err)
 	}
 
 	// Apply WHERE conditions (with OR support)
@@ -231,7 +283,7 @@ func (e *Executor) matchesNodePattern(nodeID string, nodeData map[string]interfa
 }
 
 // bfsTraverse performs BFS traversal following the path pattern
-func (e *Executor) bfsTraverse(snapshot *graphSnapshot, startNode string, pathPattern []PathElement, stats *QueryStats) [][]pathNode {
+func (e *Executor) bfsTraverse(ctx context.Context, snapshot *graphSnapshot, startNode string, pathPattern []PathElement, stats *QueryStats) [][]pathNode {
 	var results [][]pathNode
 
 	type queueItem struct {
@@ -249,10 +301,19 @@ func (e *Executor) bfsTraverse(snapshot *graphSnapshot, startNode string, pathPa
 	}}
 
 	visited := make(map[string]bool)
-	maxIterations := 10000
+	maxIterations := e.limits.MaxVisitedNodes
+	if maxIterations <= 0 {
+		maxIterations = 10000
+	}
 	iterations := 0
 
 	for len(queue) > 0 && iterations < maxIterations {
+		// Check context every 256 iterations to avoid overhead on small graphs
+		if iterations&0xFF == 0 {
+			if err := ctx.Err(); err != nil {
+				return results // Return partial results on cancellation
+			}
+		}
 		iterations++
 		current := queue[0]
 		queue = queue[1:]
@@ -364,16 +425,17 @@ func (e *Executor) bfsTraverse(snapshot *graphSnapshot, startNode string, pathPa
 }
 
 // dfsTraverse performs DFS traversal following the path pattern
-func (e *Executor) dfsTraverse(snapshot *graphSnapshot, startNode string, pathPattern []PathElement, stats *QueryStats) [][]pathNode {
+func (e *Executor) dfsTraverse(ctx context.Context, snapshot *graphSnapshot, startNode string, pathPattern []PathElement, stats *QueryStats) [][]pathNode {
 	var results [][]pathNode
 	visited := make(map[string]bool)
 
-	e.dfsRecursive(snapshot, startNode, 0, 0, false, nil, pathPattern, visited, &results, stats)
+	e.dfsRecursive(ctx, snapshot, startNode, 0, 0, false, nil, pathPattern, visited, &results, stats)
 
 	return results
 }
 
 func (e *Executor) dfsRecursive(
+	ctx context.Context,
 	snapshot *graphSnapshot,
 	node string,
 	patternIndex int,
@@ -386,6 +448,20 @@ func (e *Executor) dfsRecursive(
 	stats *QueryStats,
 ) {
 	if len(currentPath) > e.maxDepth {
+		return
+	}
+
+	// Check context periodically (every node visit)
+	if ctx.Err() != nil {
+		return
+	}
+
+	// Check visited nodes limit
+	maxVisited := e.limits.MaxVisitedNodes
+	if maxVisited <= 0 {
+		maxVisited = 10000
+	}
+	if stats.NodesTraversed >= maxVisited {
 		return
 	}
 
@@ -442,7 +518,7 @@ func (e *Executor) dfsRecursive(
 					*results = append(*results, newPath)
 				} else {
 					// Continue to next pattern segment
-					e.dfsRecursive(snapshot, node, patternIndex+1, 0, false,
+					e.dfsRecursive(ctx, snapshot, node, patternIndex+1, 0, false,
 						currentPath, pathPattern, visitedCopy, results, stats)
 				}
 			}
@@ -458,7 +534,7 @@ func (e *Executor) dfsRecursive(
 				if relPattern.Type != "" && edgeType != relPattern.Type {
 					continue
 				}
-				e.dfsRecursive(snapshot, neighbor, patternIndex, varLengthHops+1, true,
+				e.dfsRecursive(ctx, snapshot, neighbor, patternIndex, varLengthHops+1, true,
 					newPath, pathPattern, visitedCopy, results, stats)
 			}
 		}
@@ -475,7 +551,7 @@ func (e *Executor) dfsRecursive(
 			if !e.matchesNodePattern(neighbor, snapshot.nodeData[neighbor], nextNodePattern) {
 				continue
 			}
-			e.dfsRecursive(snapshot, neighbor, patternIndex+1, 0, false,
+			e.dfsRecursive(ctx, snapshot, neighbor, patternIndex+1, 0, false,
 				newPath, pathPattern, visitedCopy, results, stats)
 		}
 	}

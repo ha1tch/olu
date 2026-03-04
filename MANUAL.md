@@ -1,6 +1,6 @@
 # Olu Manual
 
-Complete reference documentation for Olu v0.9.0.
+Complete reference documentation for Olu v0.9.4 (1835 tests).
 
 ## Table of Contents
 
@@ -15,6 +15,8 @@ Complete reference documentation for Olu v0.9.0.
 9. [Graph Features](#graph-features)
 10. [Testing & Benchmarks](#testing--benchmarks)
 11. [Deployment](#deployment)
+
+Timeseries storage has its own design document: [Timeseries Design](docs/TIMESERIES_DESIGN_V3.md).
 
 ---
 
@@ -61,70 +63,135 @@ All configuration is via environment variables.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HOST` | `0.0.0.0` | Server bind address |
-| `PORT` | `9090` | Server port |
+| `OLU_HOST` | `0.0.0.0` | Server bind address |
+| `OLU_PORT` | `9090` | Server port |
 
 ### Storage
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `STORAGE_TYPE` | `jsonfile` | Backend: `jsonfile` or `sqlite` |
-| `BASE_DIR` | `data` | Base directory for JSONFile storage |
-| `DB_PATH` | `olu.db` | SQLite database path |
-| `SCHEMA_NAME` | `default` | Schema/namespace name |
+| `OLU_STORAGE_TYPE` | `jsonfile` | Backend: `jsonfile` or `sqlite` |
+| `OLU_BASE_DIR` | `data` | Base directory for JSONFile storage |
+| `OLU_DB_PATH` | `olu.db` | SQLite database path |
+| `OLU_SCHEMA_NAME` | `default` | Schema/namespace name |
 
 ### Cache
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CACHE_TYPE` | `memory` | Cache type: `memory` or `redis` |
-| `CACHE_TTL` | `300` | Cache TTL in seconds |
-| `REDIS_HOST` | `localhost` | Redis host (if using redis cache) |
-| `REDIS_PORT` | `6379` | Redis port |
+| `OLU_CACHE_TYPE` | `memory` | Cache type: `memory` or `redis` |
+| `OLU_CACHE_TTL` | `300` | Cache TTL in seconds |
+| `OLU_REDIS_HOST` | `localhost` | Redis host (if using redis cache) |
+| `OLU_REDIS_PORT` | `6379` | Redis port |
 
 ### Graph
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RSERV_GRAPH` | `indexed` | Graph mode: `indexed` or `disabled` |
-| `GRAPH_CYCLE_DETECTION` | `warn` | Cycle handling: `warn`, `error`, `ignore` |
+| `OLU_GRAPH_MODE` | `indexed` | Graph mode: `indexed` or `disabled` |
+| `OLU_GRAPH_CYCLE_DETECTION` | `warn` | Cycle handling: `warn`, `error`, `ignore` |
+| `OLU_GRAPH_MAX_VISITED_NODES` | `10000` | Max nodes visited during a single traversal |
+| `OLU_GRAPH_MAX_RESULTS` | `10000` | Max result paths returned by a graph query |
+
+When a graph limit is exceeded, the server returns a specific error code:
+
+| Code | Meaning | HTTP Status |
+|------|---------|-------------|
+| `OLU-GR005` | Visited-node limit exceeded | 413 |
+| `OLU-GR006` | Result limit exceeded | 413 |
+
+Graph queries also respect the shared `OLU_QUERY_TIMEOUT` and
+`OLU_QUERY_MAX_RESPONSE_BYTES` limits documented in the Query Guardrails
+section below.
 
 ### Features
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FULLTEXT_ENABLED` | `false` | Enable FTS5 full-text search (SQLite only) |
-| `CASCADING_DELETE` | `false` | Delete referencing entities on delete |
-| `REF_EMBED_DEPTH` | `3` | Default reference embedding depth |
-| `MAX_EMBED_DEPTH` | `10` | Maximum allowed embed depth |
-| `MAX_ENTITY_SIZE` | `1048576` | Maximum entity size in bytes |
-| `PATCH_NULL` | `store` | Null handling in PATCH: `store` or `delete` |
+| `OLU_FULLTEXT_ENABLED` | `false` | Enable FTS5 full-text search (SQLite only) |
+| `OLU_CASCADING_DELETE` | `false` | Delete referencing entities on delete |
+| `OLU_REF_EMBED_DEPTH` | `3` | Default reference embedding depth |
+| `OLU_MAX_EMBED_DEPTH` | `10` | Maximum allowed embed depth |
+| `OLU_MAX_ENTITY_SIZE` | `1048576` | Maximum entity size in bytes |
+| `OLU_TENANT_MODE` | `path` | Tenant mode: `path` or `strict` |
+| `OLU_TENANT_AUTO_REGISTER` | `false` | Auto-create tenants on first access (path mode only) |
+| `OLU_TIMESERIES_ENABLED` | `false` | Enable Pebble-backed timeseries storage (requires `strict` mode) |
+| `OLU_TS_MEMTABLE_SIZE` | `67108864` | Pebble memtable size in bytes (64 MB) |
+| `OLU_TS_BLOCK_SIZE` | `32768` | Pebble block size in bytes (32 KB) |
+| `OLU_TS_COMPRESSION` | `zstd` | Compression: `zstd`, `snappy`, or `none` |
+| `OLU_TS_L0_COMPACTION_THRESHOLD` | `4` | L0 files before compaction trigger |
+| `OLU_TS_MAX_OPEN_FILES` | `500` | Per-tenant Pebble file descriptor limit |
+| `OLU_TS_DEFAULT_RETENTION_DAYS` | `90` | Default retention policy for new tenants |
+| `OLU_TS_COMPACTION_INTERVAL` | `3600` | Retention sweep interval in seconds |
+| `OLU_TS_RETENTION_ENABLED` | `false` | Run background retention goroutine |
+| `OLU_TS_QUERY_TIMEOUT` | `30` | Per-query context deadline in seconds |
+| `OLU_TS_MAX_QUERY_EVENTS` | `10000` | Maximum events returned by a single range query or Latest |
+| `OLU_TS_MAX_SCAN_EVENTS` | `500000` | Maximum events scanned before aborting (returns OLU-TS013) |
+| `OLU_TS_MAX_RANGE_DAYS` | `366` | Maximum From→To window in days (returns OLU-TS011 if exceeded) |
+| `OLU_TS_MAX_BATCH_SIZE` | `5000` | Maximum events per batch append (returns OLU-TS006 if exceeded) |
+| `OLU_TS_MAX_RESPONSE_BYTES` | `10485760` | Maximum JSON response size in bytes (10 MB) |
+| `OLU_TS_MAX_AGGREGATE_BUCKETS` | `10000` | Maximum buckets in a windowed aggregate (returns OLU-TS019 if exceeded) |
+| `OLU_TS_MAX_AGGREGATE_BUCKETS` | `10000` | Maximum time buckets in a windowed aggregate (returns OLU-TS019 if exceeded) |
+
+### SQLite Tuning
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OLU_SQLITE_MAX_OPEN_CONNS` | `0` | Writer pool max connections (0 = backend default: 1 for WAL) |
+| `OLU_SQLITE_MAX_IDLE_CONNS` | `0` | Writer pool idle connections (0 = backend default: 1) |
+| `OLU_SQLITE_READ_POOL_SIZE` | `0` | Reader pool max connections (0 = backend default: NumCPU) |
+| `OLU_SQLITE_BUSY_TIMEOUT` | `5000` | SQLite busy timeout in milliseconds |
+| `OLU_SQLITE_CACHE_SIZE` | `2000` | SQLite page cache size (pages) |
+| `OLU_SQLITE_CONTENTION_THRESHOLD` | `95` | Adaptive lock contention threshold (0-100) |
+| `OLU_PATCH_NULL` | `store` | Null handling in PATCH: `store` or `delete` |
+
+### Query Guardrails
+
+Server-side limits that prevent runaway queries from becoming outages.
+All limits are on by default and enforced consistently across OQL, search,
+and list endpoints.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OLU_QUERY_TIMEOUT` | `30` | Max query execution time in seconds |
+| `OLU_QUERY_MAX_ROWS` | `10000` | Max rows returned by a single query |
+| `OLU_QUERY_MAX_SCAN_ROWS` | `100000` | Max rows scanned before query is aborted |
+| `OLU_QUERY_MAX_RESPONSE_BYTES` | `10485760` | Max JSON response size in bytes (10 MB) |
+
+When a limit is exceeded, the server returns a specific error code:
+
+| Code | Meaning | HTTP Status |
+|------|---------|-------------|
+| `OLU-QL008` | Query timed out | 504 |
+| `OLU-QL009` | Too many rows returned | 413 |
+| `OLU-QL010` | Too many rows scanned | 413 |
+| `OLU-QL011` | Response too large | 413 |
 
 ### Authentication
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AUTH_TYPE` | `none` | Auth type: `none`, `jwt`, `apikey` |
-| `JWT_SECRET` | | Secret key for JWT validation |
-| `JWT_ISSUER` | | Expected JWT issuer claim |
-| `API_KEYS` | | Comma-separated list of valid API keys |
+| `OLU_AUTH_TYPE` | `none` | Auth type: `none`, `jwt`, `apikey` |
+| `OLU_JWT_SECRET` | | Secret key for JWT validation |
+| `OLU_JWT_ISSUER` | | Expected JWT issuer claim |
+| `OLU_API_KEYS` | | Comma-separated list of valid API keys |
 
 ### Rate Limiting
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RATE_LIMIT_ENABLED` | `false` | Enable rate limiting |
-| `RATE_LIMIT_RATE` | `100` | Requests per window |
-| `RATE_LIMIT_WINDOW` | `60` | Window duration in seconds |
-| `RATE_LIMIT_BY_IP` | `true` | Rate limit by client IP |
-| `RATE_LIMIT_BY_KEY` | `false` | Rate limit by auth key/subject |
+| `OLU_RATE_LIMIT_ENABLED` | `false` | Enable rate limiting |
+| `OLU_RATE_LIMIT_RATE` | `100` | Requests per window |
+| `OLU_RATE_LIMIT_WINDOW` | `60` | Window duration in seconds |
+| `OLU_RATE_LIMIT_BY_IP` | `true` | Rate limit by client IP |
+| `OLU_RATE_LIMIT_BY_KEY` | `false` | Rate limit by auth key/subject |
 
 ### Observability
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `METRICS_ENABLED` | `true` | Enable Prometheus metrics |
-| `DEBUG` | `false` | Enable debug logging |
+| `OLU_METRICS_ENABLED` | `true` | Enable Prometheus metrics |
+| `OLU_DEBUG` | `false` | Enable debug logging |
 
 ---
 
@@ -277,6 +344,216 @@ GET /version       # Version info
 GET /metrics       # Prometheus metrics
 ```
 
+### Timeseries Operations
+
+Available only when `OLU_TIMESERIES_ENABLED=true` and `OLU_TENANT_MODE=strict`.
+All timeseries endpoints are tenant-scoped under `/api/v1/tenant/{id}/ts/`.
+
+Data is stored in per-tenant Pebble (LSM) instances with Zstd compression.
+~30 bytes per event effective. See [Timeseries Design](docs/TIMESERIES_DESIGN_V3.md)
+for the full specification.
+
+#### Provisioning
+
+```http
+POST /api/v1/tenant/{id}/ts/provision
+```
+
+Enables timeseries storage for a tenant. Idempotent. The tenant must already
+exist in the registry (`OLU_TENANT_MODE=strict` requires this). Returns 201
+on creation, 200 if already provisioned.
+
+#### Timeline Management
+
+Each tenant has up to 65535 named timelines (IDs 1–0xFFFF). A timeline
+declares a fixed number of *dimensions* (1–5 uint64 values) used as the
+sort key prefix. Dimensions are immutable after the first event is written.
+
+```http
+POST   /api/v1/tenant/{id}/ts/timelines              # Define a timeline
+GET    /api/v1/tenant/{id}/ts/timelines              # List all timelines
+GET    /api/v1/tenant/{id}/ts/timelines/{tid}        # Get a timeline
+PATCH  /api/v1/tenant/{id}/ts/timelines/{tid}        # Update name / retention
+GET    /api/v1/tenant/{id}/ts/timelines/{tid}/stats  # Timeline diagnostics
+```
+
+Define request body:
+```json
+{
+  "id": 1,
+  "dims": 2,
+  "name": "temperature",
+  "retention_days": 90
+}
+```
+
+`dims` is required on define and immutable after the first write. `name` and
+`retention_days` can be changed freely via PATCH. `retention_days: 0` inherits
+the store-level default (`OLU_TS_DEFAULT_RETENTION_DAYS`); a negative value
+disables expiry for the timeline.
+
+#### Writing Events
+
+```http
+POST /api/v1/tenant/{id}/ts/events         # Single event
+POST /api/v1/tenant/{id}/ts/events/batch   # Atomic batch (up to OLU_TS_MAX_BATCH_SIZE)
+```
+
+Single event body:
+```json
+{
+  "timeline": 1,
+  "dims":     [42, 7],
+  "time":     "2026-01-15T10:30:00Z",
+  "nums":     [23.4, 1013.25],
+  "payload":  "base64encodedopaquebytes"
+}
+```
+
+`dims` must match the timeline's declared dimension count. `time` must be an
+RFC 3339 timestamp at or after the Unix epoch. `nums` holds up to 7 float64
+values (no NaN). `payload` is optional opaque bytes (up to 64 KB, base64).
+
+Batch body:
+```json
+{ "events": [ ...event objects... ] }
+```
+
+A batch is atomic: if any event fails validation, no events are written.
+
+#### Querying Events
+
+```http
+GET /api/v1/tenant/{id}/ts/events?timeline=1&dims=42,7&from=...&to=...
+```
+
+Query parameters: `timeline` (required), `dims` (required, comma-separated),
+`from` / `to` (required, RFC 3339), `limit` (default 1000, max capped by
+`OLU_TS_MAX_QUERY_EVENTS`), `order` (`asc` or `desc`, default `asc`).
+
+`dims` may be a *prefix*: supplying fewer values than the timeline's dimension
+count returns all events matching that leading prefix across all remaining
+dimension values. A Go-side time filter is applied to prevent out-of-range
+events leaking through the prefix scan.
+
+```http
+GET /api/v1/tenant/{id}/ts/events/latest?timeline=1&dims=42,7&n=10
+```
+
+Returns the N most recent events (default 10, max capped by
+`OLU_TS_MAX_QUERY_EVENTS`) matching the dimension prefix.
+
+#### Aggregation
+
+```http
+POST /api/v1/tenant/{id}/ts/aggregate
+```
+
+```json
+{
+  "timeline":  1,
+  "dims":      [42],
+  "from":      "2026-01-01T00:00:00Z",
+  "to":        "2026-01-08T00:00:00Z",
+  "function":  "avg",
+  "num_field": 0,
+  "interval":  "1h"
+}
+```
+
+`function`: `avg`, `min`, `max`, `sum`, `count`. `num_field`: 0-based index
+into the event's `nums` array (0–6). `interval`: one of `1m 5m 15m 30m 1h
+6h 12h 1d 7d`. Omit `interval` for a scalar result. Partial-prefix `dims`
+are supported with the same time filter as range queries.
+
+#### Range Aggregate (single-pass, all fields)
+
+```http
+POST /api/v1/tenant/{id}/ts/range_aggregate
+```
+
+```json
+{
+  "timeline": 1,
+  "dims":     [42],
+  "from":     "2026-01-01T00:00:00Z",
+  "to":       "2026-01-08T00:00:00Z"
+}
+```
+
+Computes count, sum, avg, min, and max for **all seven numeric fields** in a
+single Pebble scan pass. More efficient than issuing multiple `/aggregate`
+calls when several fields are needed. No `function` or `num_field` parameter —
+the result always covers all fields.
+
+Response shape:
+
+```json
+{
+  "count": 12500,
+  "fields": [true, true, true, false, false, false, false],
+  "sums":   [1230.5, 98432.1, 0.0, 0, 0, 0, 0],
+  "avgs":   [0.098,  7.874,   0.0, 0, 0, 0, 0],
+  "mins":   [0.001,  1.2,     0.0, 0, 0, 0, 0],
+  "maxs":   [0.999,  99.9,    0.0, 0, 0, 0, 0]
+}
+```
+
+`fields[i]` is `true` if field `i` was present in at least one event in the
+range. Entries for absent fields are zero and should be ignored.
+
+#### Convenience Range Functions
+
+Single-field scalar functions over a range. All delegate to the same scan as
+`range_aggregate` internally; performance is identical.
+
+```http
+GET /api/v1/tenant/{id}/ts/range/sum?timeline=1&dims=42&from=...&to=...&num_field=0
+GET /api/v1/tenant/{id}/ts/range/avg?timeline=1&dims=42&from=...&to=...&num_field=0
+GET /api/v1/tenant/{id}/ts/range/min?timeline=1&dims=42&from=...&to=...&num_field=0
+GET /api/v1/tenant/{id}/ts/range/max?timeline=1&dims=42&from=...&to=...&num_field=0
+GET /api/v1/tenant/{id}/ts/range/count?timeline=1&dims=42&from=...&to=...&num_field=0
+```
+
+Each returns `{ "value": <float64> }` (or `{ "count": <uint64> }` for count).
+Use `range_aggregate` when you need more than one statistic to avoid redundant scans.
+
+#### Retention and Diagnostics
+
+```http
+GET   /api/v1/tenant/{id}/ts/retention    # View store-level default retention
+PATCH /api/v1/tenant/{id}/ts/retention    # Update store-level default retention
+GET   /api/v1/tenant/{id}/ts/stats        # Tenant store diagnostics
+```
+
+Retention PATCH body: `{ "retention_days": 90 }`. Setting `0` disables expiry.
+
+Stats response includes `timelines` (count) and `disk_bytes` (Pebble estimate).
+Per-timeline stats (via `GET /ts/timelines/{tid}/stats`) include
+`total_events` (approximate — eventually consistent after crash),
+`oldest_event`, and `newest_event`.
+
+#### Error Codes
+
+| Code | HTTP | Meaning |
+|------|------|---------|
+| OLU-TS002 | 404/405 | Timeseries not enabled |
+| OLU-TS003 | 400 | Tenant not provisioned for timeseries |
+| OLU-TS004 | 400 | Timeline not defined |
+| OLU-TS005 | 400 | Timestamp before Unix epoch or invalid format |
+| OLU-TS006 | 400 | Batch exceeds `OLU_TS_MAX_BATCH_SIZE` |
+| OLU-TS007 | 400 | Dimension count mismatch |
+| OLU-TS008 | 400 | Unknown aggregate function |
+| OLU-TS009 | 400 | `num_field` out of range (0–6) |
+| OLU-TS010 | 400 | Invalid interval value |
+| OLU-TS011 | 400 | Query window exceeds `OLU_TS_MAX_RANGE_DAYS` |
+| OLU-TS013 | 400 | Scan aborted — exceeded `OLU_TS_MAX_SCAN_EVENTS` |
+| OLU-TS016 | 409 | Attempt to change dims after first write |
+| OLU-TS017 | 400 | NaN in numeric field |
+| OLU-TS018 | 400 | Reserved timeline ID (0) |
+| OLU-TS019 | 400 | Aggregate bucket count exceeded `OLU_TS_MAX_AGGREGATE_BUCKETS` |
+| OLU-TS019 | 400 | Aggregate bucket limit exceeded `OLU_TS_MAX_AGGREGATE_BUCKETS` |
+
 ---
 
 ## Query Languages
@@ -381,9 +658,9 @@ users:1 <-> users:2
 ### JWT Authentication
 
 ```bash
-export AUTH_TYPE=jwt
-export JWT_SECRET=your-secret-key-min-32-chars
-export JWT_ISSUER=your-app  # Optional
+export OLU_AUTH_TYPE=jwt
+export OLU_JWT_SECRET=your-secret-key-min-32-chars
+export OLU_JWT_ISSUER=your-app  # Optional
 ```
 
 Request with JWT:
@@ -400,8 +677,8 @@ JWT requirements:
 ### API Key Authentication
 
 ```bash
-export AUTH_TYPE=apikey
-export API_KEYS=key1,key2,key3
+export OLU_AUTH_TYPE=apikey
+export OLU_API_KEYS=key1,key2,key3
 ```
 
 Request with API key:
@@ -430,10 +707,10 @@ By default, these paths don't require authentication:
 Enable rate limiting to protect your API:
 
 ```bash
-export RATE_LIMIT_ENABLED=true
-export RATE_LIMIT_RATE=100      # requests
-export RATE_LIMIT_WINDOW=60     # seconds
-export RATE_LIMIT_BY_IP=true
+export OLU_RATE_LIMIT_ENABLED=true
+export OLU_RATE_LIMIT_RATE=100      # requests
+export OLU_RATE_LIMIT_WINDOW=60     # seconds
+export OLU_RATE_LIMIT_BY_IP=true
 ```
 
 ### Response Headers
@@ -505,9 +782,9 @@ scrape_configs:
 Human-readable storage using JSON files.
 
 ```bash
-export STORAGE_TYPE=jsonfile
-export BASE_DIR=data
-export SCHEMA_NAME=myapp
+export OLU_STORAGE_TYPE=jsonfile
+export OLU_BASE_DIR=data
+export OLU_SCHEMA_NAME=myapp
 ```
 
 Directory structure:
@@ -536,19 +813,34 @@ data/
 
 ### SQLite Storage
 
-Production-ready storage with ACID guarantees.
+Production-ready storage with ACID guarantees, WAL mode, and read/write connection pool split.
 
 ```bash
-export STORAGE_TYPE=sqlite
-export DB_PATH=olu.db
-export FULLTEXT_ENABLED=true
+export OLU_STORAGE_TYPE=sqlite
+export OLU_DB_PATH=olu.db
+export OLU_FULLTEXT_ENABLED=true
 ```
 
 **Advantages:**
-- ACID transactions
-- Better performance
-- Full-text search support
+- ACID transactions with WAL mode for concurrent reads
+- Separate reader and writer connection pools
+- Full-text search support (FTS5)
+- Adaptive lock contention monitoring
 - Single-file database
+
+#### Read/Write Connection Pool Split
+
+SQLite in WAL mode supports concurrent readers alongside a single writer, but only if they use separate database connections. Olu maintains two connection pools:
+
+**Writer pool** (`OLU_SQLITE_MAX_OPEN_CONNS`, default: 1): Handles all INSERT, UPDATE, DELETE, and transaction operations. Default of 1 matches SQLite's single-writer constraint under WAL. A future PostgreSQL backend would use a higher default.
+
+**Reader pool** (`OLU_SQLITE_READ_POOL_SIZE`, default: NumCPU): Handles all SELECT, COUNT, and search queries. Uses `PRAGMA query_only=ON` to prevent accidental writes. Scales with available CPU cores.
+
+Both pools share identical WAL, synchronous, cache, and busy_timeout pragmas. Pool size defaults are 0, meaning "let the backend decide" — this keeps the configuration backend-neutral for future storage backends.
+
+#### Adaptive Concurrency
+
+Under high write contention, SQLite returns SQLITE_BUSY. Olu's adaptive lock monitors contention rates and automatically backs off when the threshold is exceeded (`OLU_SQLITE_CONTENTION_THRESHOLD`, default 95%). This prevents cascading failures under burst write loads.
 
 **Migration:**
 
@@ -594,9 +886,9 @@ References are automatically:
 Configure cycle handling:
 
 ```bash
-export GRAPH_CYCLE_DETECTION=warn   # Log warning, allow
-export GRAPH_CYCLE_DETECTION=error  # Reject edge creation
-export GRAPH_CYCLE_DETECTION=ignore # Allow silently
+export OLU_GRAPH_CYCLE_DETECTION=warn   # Log warning, allow
+export OLU_GRAPH_CYCLE_DETECTION=error  # Reject edge creation
+export OLU_GRAPH_CYCLE_DETECTION=ignore # Allow silently
 ```
 
 ### Reference Embedding
@@ -634,7 +926,7 @@ GET /api/v1/users/1?embed_depth=1
 When enabled, deleting an entity also deletes entities that reference it:
 
 ```bash
-export CASCADING_DELETE=true
+export OLU_CASCADING_DELETE=true
 ```
 
 ---
@@ -729,10 +1021,10 @@ services:
     ports:
       - "9090:9090"
     environment:
-      - STORAGE_TYPE=jsonfile
-      - CACHE_TYPE=memory
-      - AUTH_TYPE=none
-      - RSERV_GRAPH=indexed
+      - OLU_STORAGE_TYPE=jsonfile
+      - OLU_CACHE_TYPE=memory
+      - OLU_AUTH_TYPE=none
+      - OLU_GRAPH_MODE=indexed
     volumes:
       - ./data:/app/data
       - ./schema:/app/schema
@@ -750,29 +1042,30 @@ services:
       - "9090:9090"
     environment:
       # Storage
-      - STORAGE_TYPE=sqlite
-      - DB_PATH=/app/data/olu.db
-      - FULLTEXT_ENABLED=true
+      - OLU_STORAGE_TYPE=sqlite
+      - OLU_DB_PATH=/app/data/olu.db
+      - OLU_FULLTEXT_ENABLED=true
       # Cache
-      - CACHE_TYPE=redis
-      - CACHE_TTL=300
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      - OLU_CACHE_TYPE=redis
+      - OLU_CACHE_TTL=300
+      - OLU_REDIS_HOST=redis
+      - OLU_REDIS_PORT=6379
       # Graph
-      - RSERV_GRAPH=indexed
-      - GRAPH_CYCLE_DETECTION=error
+      - OLU_GRAPH_MODE=indexed
+      - OLU_GRAPH_CYCLE_DETECTION=error
       # Authentication
-      - AUTH_TYPE=apikey
-      - API_KEYS=${API_KEYS}
+      - OLU_AUTH_TYPE=apikey
+      - OLU_API_KEYS=${API_KEYS}
       # Rate limiting
-      - RATE_LIMIT_ENABLED=true
-      - RATE_LIMIT_RATE=100
-      - RATE_LIMIT_WINDOW=60
-      - RATE_LIMIT_BY_KEY=true
+      - OLU_RATE_LIMIT_ENABLED=true
+      - OLU_RATE_LIMIT_RATE=100
+      - OLU_RATE_LIMIT_WINDOW=60
+      - OLU_RATE_LIMIT_BY_KEY=true
       # Metrics
-      - METRICS_ENABLED=true
-      # Multi-tenancy (optional)
-      - TENANT_MODE=path
+      - OLU_METRICS_ENABLED=true
+      # Multi-tenancy
+      - OLU_TENANT_MODE=strict
+      - OLU_TENANT_AUTO_REGISTER=false
     volumes:
       - olu-data:/app/data
       - ./schema:/app/schema
@@ -936,6 +1229,24 @@ sqlite3 /app/data/olu.db ".backup /backup/olu-$(date +%Y%m%d).db"
 curl http://localhost:9090/api/v1/export > backup-$(date +%Y%m%d).zip
 ```
 
+#### Timeseries Backup
+
+Timeseries backup tooling is **not yet available**. The `olu-admin` binary
+referenced in the timeseries design documents has not been implemented.
+
+If timeseries is enabled, the underlying Pebble data directories can be
+backed up manually by copying each tenant's directory while the server is
+stopped. Pebble SSTables are immutable, so a filesystem-level copy of a
+quiescent directory is consistent. However, copying while the server is
+running risks capturing an inconsistent state.
+
+For production use with timeseries enabled, plan for a brief maintenance
+window (stop the server, copy the directories, restart) until checkpoint-
+based backup tooling is shipped.
+
+See [Timeseries Design](docs/TIMESERIES_DESIGN_V3.md) Section 13 for the
+planned backup architecture using Pebble checkpoints.
+
 #### Scheduled Backup (cron)
 
 ```bash
@@ -944,15 +1255,26 @@ curl http://localhost:9090/api/v1/export > backup-$(date +%Y%m%d).zip
 
 ### Scaling Considerations
 
-**Single instance (recommended for most use cases):**
-- Memory cache is sufficient
-- SQLite handles thousands of requests/second
-- Simpler operations
+**Single instance with SQLite (recommended for most use cases):**
+- Read/write split provides concurrent reads with WAL mode
+- SQLite handles ~2,100 writes/sec (single-writer) and 16,000+ reads/sec
+- Memory cache is sufficient for single instances
+- Capacity for 10,000 to 1,900,000 IoT sensors depending on reporting interval
+
+**SQLite capacity estimates (single instance):**
+
+| Reporting interval | Max sensors | Binding constraint |
+|--------------------|-------------|-------------------|
+| 1 second | ~10,000 | Write throughput (~2,100 w/s) |
+| 5 seconds | ~50,000 | Write throughput |
+| 30 seconds | ~300,000 | Working set / cache pressure |
+| 5 minutes | ~1,000,000 | Database size (~50 GB) |
+| 15 minutes | ~1,900,000 | Database size (~100 GB) |
 
 **Multiple instances:**
 - Use Redis cache for shared state
-- Each instance needs access to same SQLite file (not recommended) or use separate databases with external coordination
-- Consider whether you actually need horizontal scaling — olu handles significant load on a single instance
+- Each instance needs its own SQLite database (sharing a single file across instances is not supported)
+- See [Fleet Architecture](docs/FLEET_ARCHITECTURE.md) for multi-instance deployment with tenant placement
 
 ---
 
@@ -967,8 +1289,8 @@ Olu supports two cache backends:
 Simple in-process LRU cache. Good for development and single-instance deployments.
 
 ```bash
-export CACHE_TYPE=memory
-export CACHE_TTL=300
+export OLU_CACHE_TYPE=memory
+export OLU_CACHE_TTL=300
 ```
 
 **Characteristics:**
@@ -982,10 +1304,10 @@ export CACHE_TTL=300
 Production-grade distributed cache. Use when running multiple instances or when you need per-item TTL control.
 
 ```bash
-export CACHE_TYPE=redis
-export CACHE_TTL=300
-export REDIS_HOST=localhost
-export REDIS_PORT=6379
+export OLU_CACHE_TYPE=redis
+export OLU_CACHE_TTL=300
+export OLU_REDIS_HOST=localhost
+export OLU_REDIS_PORT=6379
 ```
 
 **Characteristics:**
@@ -1016,39 +1338,50 @@ This means **newly created entity types are recognised automatically** without s
 
 ### Multi-Tenancy
 
-Olu supports path-based tenant isolation via `/api/v1/tenant/{tenant_id}/...` routes.
+Olu supports two operational modes for tenant isolation.
 
-#### Tenant Modes
+#### Operational Modes
 
-| Mode | Behaviour |
-|------|-----------|
-| `none` | Default. No tenant features enabled. |
-| `path` | Tenant routes available. Non-tenant routes also work. |
-| `strict` | All entity requests require tenant context. Non-tenant entity routes return 403. |
+| Mode | CRUD | REFs | OQL | FTS | Graph | Non-tenant routes |
+|------|------|------|-----|-----|-------|-------------------|
+| `path` (single-tenant) | \u2713 | \u2713 | \u2713 | \u2713 | \u2713 | Available (default store) |
+| `strict` (multi-tenant) | \u2713 | \u2713 | \u2713 | \u2713 | \u2717 | Blocked |
+
+In strict mode, graph is automatically disabled because the in-memory graph structure is not yet tenant-isolated. OQL, search, and export routes are only registered under tenant-prefixed paths.
 
 Configure via environment:
 ```bash
-export TENANT_MODE=strict
+export OLU_TENANT_MODE=strict
+export OLU_TENANT_AUTO_REGISTER=false
 ```
+
+#### Tenant Scoping Architecture
+
+Tenant isolation is enforced at the **storage layer**. Each tenant gets a scoped `Store` instance that filters all operations by `tenant_id`. This means:
+
+- Every CRUD operation (Create, Get, List, Update, Patch, Delete) is scoped to the tenant's store
+- OQL queries (both sync and async) execute against the tenant-scoped store
+- OQL SQL push-down includes `AND tenant_id = ?` in generated SQL
+- Async OQL jobs capture the tenant-scoped store at submission time, so background goroutines execute in the correct scope
+- Full-text search queries include tenant_id filtering
+- REF resolution only resolves references within the same tenant
+
+#### Auto-Registration
+
+In `path` mode, the `OLU_TENANT_AUTO_REGISTER` flag controls whether unknown tenant names in the URL automatically create new tenants:
+
+| `OLU_TENANT_AUTO_REGISTER` | Behaviour |
+|-----------------------------|-----------|
+| `true` | `/api/v1/tenant/new-name/...` creates tenant "new-name" on first access |
+| `false` (default) | Unknown tenants return 404 |
+
+In `strict` mode, auto-registration is ignored; tenants must be pre-registered.
 
 #### Security Model
 
-**Important:** This is **application-level isolation**, not security isolation.
+This is **application-level isolation** designed for trusted environments (internal services, not adversarial internet clients). The isolation model prevents accidental cross-tenant data access in normal CRUD, OQL, and search flows.
 
-In `path` mode:
-- Tenant data is tagged with `tenant_id` field
-- Queries filter by tenant automatically on tenant routes
-- Non-tenant routes can still access all data
-
-In `strict` mode:
-- Non-tenant entity routes are blocked (403 Forbidden)
-- System routes (`/health`, `/metrics`, etc.) remain accessible
-- Graph, OQL, schema, and export routes remain accessible
-
-**For true security isolation between hostile tenants:**
-- Use separate Olu instances per tenant
-- Use separate databases per tenant
-- Implement authentication that maps users to tenants
+It is not a compliance-grade security boundary. For hostile multi-tenancy, use separate Olu instances per tenant with separate databases.
 
 #### Example Usage
 
@@ -1061,14 +1394,91 @@ curl -X POST http://localhost:9090/api/v1/tenant/acme/users \
 # List only acme's users
 curl http://localhost:9090/api/v1/tenant/acme/users
 
-# In strict mode, this returns 403:
+# OQL scoped to tenant
+curl -X POST http://localhost:9090/api/v1/tenant/acme/oql/query \
+  -d '{"query": "SELECT * FROM users WHERE status = '"'"'active'"'"'"}'
+
+# In strict mode, non-tenant routes return 403:
 curl http://localhost:9090/api/v1/users
 # {"error": "Tenant context required. Use /api/v1/tenant/{tenant_id}/... routes"}
 ```
 
 ---
 
+## Versioning and Compatibility
+
+### Version Scheme
+
+Olu follows semantic versioning: `MAJOR.MINOR.PATCH`. During the `0.x`
+series, minor versions may include breaking changes to the database format
+or API. The current version is `0.9.4`.
+
+### Database Format Stability
+
+**Within `0.9.x`:** The SQLite schema is stable. Patch releases (`0.9.1`,
+`0.9.2`, etc.) will not require migrations. If a schema change is needed,
+it will be shipped as part of `0.10.0` or later with an explicit migration.
+
+**Across minor versions (`0.9` → `0.10`):** Schema changes are possible.
+When they occur, `olu-migrate` will be updated with the necessary migration
+subcommand. Release notes will state whether a migration is required.
+
+### When Migrations Are Required
+
+Migrations are required when:
+
+- A new column is added to the `entities` or `tenants` table.
+- A new system table is created (e.g., `entity_sequences` was added in
+  the v1 → v2 schema migration).
+- An index is changed or added.
+
+Migrations are **not** required for:
+
+- New API endpoints.
+- Configuration changes.
+- Bug fixes that don't alter stored data.
+
+The `olu-migrate schema` command is idempotent: running it against an
+already-migrated database is safe and produces no changes.
+
+### Rollback
+
+Rollback is **not supported**. Migrations are forward-only. Before
+upgrading, take a backup:
+
+```bash
+sqlite3 /app/data/olu.db ".backup /backup/olu-pre-upgrade.db"
+```
+
+If the upgrade fails, restore from the backup and stay on the previous
+version.
+
+### Safe Upgrade Steps
+
+1. **Back up** the SQLite database and any Pebble timeseries directories.
+2. **Stop** the running server.
+3. **Replace** the `olu` binary with the new version.
+4. **Run migrations** if the release notes require it:
+   `olu-migrate schema -db /path/to/olu.db`
+5. **Start** the server.
+6. **Verify** via `/health` and `/ready`.
+
+For zero-downtime upgrades behind a load balancer, run step 4 before
+starting the new instance. The migrated database is backwards-compatible
+within the same minor version, so the old binary can still read it if
+you need to roll back the binary without rolling back the database.
+
+### API Compatibility
+
+REST API endpoints are stable within a minor version. New endpoints may
+be added in patch releases but existing endpoints will not change their
+request/response format. Deprecations will be announced at least one
+minor version before removal.
+
 ## Troubleshooting
+
+For a quick-reference operational guide covering health checks, common
+failure modes, and emergency procedures, see [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
 ### Common Issues
 
@@ -1082,16 +1492,16 @@ curl http://localhost:9090/api/v1/users
 
 **Graph queries return empty**
 - Graph may not be initialized
-- Check: `RSERV_GRAPH=indexed`
+- Check: `OLU_GRAPH_MODE=indexed`
 
 **Rate limiting too aggressive**
-- Adjust `RATE_LIMIT_RATE` and `RATE_LIMIT_WINDOW`
-- Consider `RATE_LIMIT_BY_KEY=true` for authenticated clients
+- Adjust `OLU_RATE_LIMIT_RATE` and `OLU_RATE_LIMIT_WINDOW`
+- Consider `OLU_RATE_LIMIT_BY_KEY=true` for authenticated clients
 
 ### Debug Mode
 
 ```bash
-export DEBUG=true
+export OLU_DEBUG=true
 ```
 
 Enables verbose logging including:

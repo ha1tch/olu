@@ -1,9 +1,14 @@
+// Copyright (c) 2026 haitch
+// Licensed under the Apache License, Version 2.0
+// https://www.apache.org/licenses/LICENSE-2.0
+
 package server
 
 import (
 	"archive/zip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,8 +20,13 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	oluerr "github.com/ha1tch/olu/pkg/errors"
 	"github.com/ha1tch/olu/pkg/graph"
 	"github.com/ha1tch/olu/pkg/models"
+	"github.com/ha1tch/olu/pkg/oql"
+	"github.com/ha1tch/olu/pkg/storage"
+	"github.com/ha1tch/olu/pkg/sulpher"
+	"github.com/ha1tch/olu/pkg/tenant"
 	"github.com/ha1tch/olu/pkg/version"
 )
 
@@ -26,87 +36,102 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request) {
 	idStr := chi.URLParam(r, "id")
 
 	if err := validateEntityName(entity); err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrInvalidEntity, err.Error())
 		return
 	}
 
 	id, err := strconv.Atoi(idStr)
 	if err != nil || id < 0 {
-		s.writeError(w, http.StatusBadRequest, "Invalid ID")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrInvalidID, "Invalid ID")
 		return
 	}
 
 	var patchData map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&patchData); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
+	if !s.decodeJSON(w, r, &patchData) {
 		return
 	}
 
-	// Get existing entity
-	existing, err := s.storage.Get(r.Context(), entity, id)
-	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			s.writeError(w, http.StatusNotFound,
-				fmt.Sprintf("Resource of entity %s with id %d not found", entity, id))
-			return
-		}
-		s.logger.Error().Err(err).Msg("Failed to get entity")
-		s.writeError(w, http.StatusInternalServerError, "Failed to get entity")
-		return
-	}
-
-	// Verify tenant access if in tenant-scoped route
-	tenantID := getTenantID(r.Context())
-	if tenantID != "" {
-		if !matchesTenant(existing, tenantID) {
-			s.writeError(w, http.StatusNotFound,
-				fmt.Sprintf("Resource of entity %s with id %d not found", entity, id))
-			return
-		}
-	}
-
-	// Handle null behavior
+	// Track which fields are being updated (for the response)
 	updatedFields := []string{}
-	for key, value := range patchData {
-		// Skip id and tenant_id - these cannot be changed
-		if key == "id" || key == "tenant_id" {
-			continue
+	for key := range patchData {
+		if key != "id" {
+			updatedFields = append(updatedFields, key)
 		}
-		if value == nil && s.config.PatchNullBehavior == "delete" {
-			delete(existing, key)
-		} else {
-			existing[key] = value
-		}
-		updatedFields = append(updatedFields, key)
 	}
 
-	// Validate merged data
-	if valid, errors := s.validator.Validate(entity, existing); !valid {
-		s.writeJSON(w, http.StatusBadRequest, map[string]interface{}{
-			"error":   "Validation failed",
-			"details": errors,
-		})
-		return
+	// When PatchNullBehavior is "store", nil values should be stored as
+	// JSON null (the default patchInner behaviour deletes nil keys).
+	// We signal "store null" by replacing nil with a json.RawMessage("null")
+	// which the storage layer will persist as a JSON null value.
+	// When PatchNullBehavior is "delete" (default), nil means remove the key,
+	// which is what patchInner already does.
+	// (No transformation needed for "delete" mode.)
+
+	// Collect fields to delete (nil values in "delete" mode)
+	var deleteKeys []string
+	if s.config.PatchNullBehavior == "delete" {
+		for key, value := range patchData {
+			if key != "id" && value == nil {
+				deleteKeys = append(deleteKeys, key)
+				delete(patchData, key) // don't send nil to the store
+			}
+		}
 	}
 
-	// Update
-	if err := s.storage.Update(r.Context(), entity, id, existing); err != nil {
+	store := s.getStore(r.Context())
+
+	// Validation errors captured by the callback
+	var validationErrors []string
+	var validationFailed bool
+
+	validate := func(merged map[string]interface{}) error {
+		// Apply key deletions inside the transaction
+		for _, key := range deleteKeys {
+			delete(merged, key)
+		}
+
+		valid, errs := s.validator.Validate(entity, merged)
+		if !valid {
+			validationFailed = true
+			validationErrors = errs
+			return fmt.Errorf("validation failed")
+		}
+		return nil
+	}
+
+	if err := store.PatchValidated(r.Context(), entity, id, patchData, validate); err != nil {
+		if validationFailed {
+			s.writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+				"error": map[string]interface{}{
+					"code":    string(oluerr.ErrValidationFailed),
+					"message": "Validation failed",
+					"status":  http.StatusBadRequest,
+				},
+				"details": validationErrors,
+			})
+			return
+		}
+		if errors.Is(err, storage.ErrNotFound) {
+			s.writeError(w, http.StatusNotFound, oluerr.ErrEntityNotFound,
+				fmt.Sprintf("Resource of entity %s with id %d not found", entity, id))
+			return
+		}
+		if errors.Is(err, storage.ErrConflict) {
+			s.writeError(w, http.StatusConflict, oluerr.ErrVersionConflict,
+				fmt.Sprintf("Version conflict: %s with id %d has been modified by another request", entity, id))
+			return
+		}
 		s.logger.Error().Err(err).Msg("Failed to patch entity")
-		s.writeError(w, http.StatusInternalServerError, "Failed to patch entity")
+		s.writeError(w, http.StatusInternalServerError, oluerr.ErrStorageFailed, "Failed to patch entity")
 		return
 	}
 
-	// Update graph
-	if s.config.GraphEnabled {
-		if err := s.graph.UpdateFromEntity(entity, id, existing); err != nil {
-			s.logger.Error().Err(err).Msg("Failed to update graph")
-		}
-		if s.persister != nil {
-			s.persister.MarkDirty()
-		}
+	// Fetch the merged entity for graph update (post-commit, best-effort)
+	if merged, err := store.Get(r.Context(), entity, id); err == nil {
+		s.updateGraph(r.Context(), entity, id, merged)
 	}
 
-	s.invalidateCache(entity)
+	s.invalidateCacheForID(r.Context(), entity, id)
 	s.logger.Info().Str("entity", entity).Int("id", id).Msg("Patched entity")
 
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -121,31 +146,22 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	idStr := chi.URLParam(r, "id")
 
 	if err := validateEntityName(entity); err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrInvalidEntity, err.Error())
 		return
 	}
 
 	id, err := strconv.Atoi(idStr)
 	if err != nil || id < 0 {
-		s.writeError(w, http.StatusBadRequest, "Invalid ID")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrInvalidID, "Invalid ID")
 		return
 	}
 
-	// Check if entity exists
-	if !s.storage.Exists(r.Context(), entity, id) {
-		s.writeError(w, http.StatusNotFound,
+	// Check if entity exists (using tenant-scoped store)
+	store := s.getStore(r.Context())
+	if !store.Exists(r.Context(), entity, id) {
+		s.writeError(w, http.StatusNotFound, oluerr.ErrEntityNotFound,
 			fmt.Sprintf("Resource of entity %s with id %d not found", entity, id))
 		return
-	}
-
-	// Verify tenant access if in tenant-scoped route
-	if tenantID := getTenantID(r.Context()); tenantID != "" {
-		existing, err := s.storage.Get(r.Context(), entity, id)
-		if err != nil || !matchesTenant(existing, tenantID) {
-			s.writeError(w, http.StatusNotFound,
-				fmt.Sprintf("Resource of entity %s with id %d not found", entity, id))
-			return
-		}
 	}
 
 	// Handle cascading delete
@@ -154,31 +170,23 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		refs, err := s.cascadeDelete(r.Context(), entity, id)
 		if err != nil {
 			s.logger.Error().Err(err).Msg("Cascade delete failed")
-			s.writeError(w, http.StatusInternalServerError, err.Error())
+			s.writeError(w, http.StatusInternalServerError, oluerr.ErrStorageFailed, err.Error())
 			return
 		}
 		deletedRefs = refs
 	} else {
 		// Simple delete
-		if err := s.storage.Delete(r.Context(), entity, id); err != nil {
+		if err := store.Delete(r.Context(), entity, id); err != nil {
 			s.logger.Error().Err(err).Msg("Failed to delete entity")
-			s.writeError(w, http.StatusInternalServerError, "Failed to delete entity")
+			s.writeError(w, http.StatusInternalServerError, oluerr.ErrStorageFailed, "Failed to delete entity")
 			return
 		}
 
 		// Update graph
-		if s.config.GraphEnabled {
-			nodeID := fmt.Sprintf("%s:%d", entity, id)
-			if err := s.graph.RemoveNode(nodeID); err != nil {
-				s.logger.Error().Err(err).Msg("Failed to remove from graph")
-			}
-			if s.persister != nil {
-				s.persister.MarkDirty()
-			}
-		}
+		s.removeGraph(r.Context(), entity, id)
 	}
 
-	s.invalidateCache(entity)
+	s.invalidateCacheForID(r.Context(), entity, id)
 	s.logger.Info().Str("entity", entity).Int("id", id).Msg("Deleted entity")
 
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -193,62 +201,54 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 	idStr := chi.URLParam(r, "id")
 
 	if err := validateEntityName(entity); err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrInvalidEntity, err.Error())
 		return
 	}
 
 	id, err := strconv.Atoi(idStr)
 	if err != nil || id < 0 {
-		s.writeError(w, http.StatusBadRequest, "Invalid ID")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrInvalidID, "Invalid ID")
 		return
 	}
 
-	// Check if already exists
-	if s.storage.Exists(r.Context(), entity, id) {
-		s.writeError(w, http.StatusConflict,
+	// Check if already exists (using tenant-scoped store)
+	store := s.getStore(r.Context())
+	if store.Exists(r.Context(), entity, id) {
+		s.writeError(w, http.StatusConflict, oluerr.ErrVersionConflict,
 			fmt.Sprintf("Resource of entity %s with id %d already exists", entity, id))
 		return
 	}
 
 	var data map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
+	if !s.decodeJSON(w, r, &data) {
 		return
-	}
-
-	// Inject tenant_id if in tenant-scoped route
-	if tenantID := getTenantID(r.Context()); tenantID != "" {
-		data["tenant_id"] = tenantID
 	}
 
 	// Validate
 	data["id"] = id
 	if valid, errors := s.validator.Validate(entity, data); !valid {
 		s.writeJSON(w, http.StatusBadRequest, map[string]interface{}{
-			"error":   "Validation failed",
+			"error": map[string]interface{}{
+				"code":    string(oluerr.ErrValidationFailed),
+				"message": "Validation failed",
+				"status":  http.StatusBadRequest,
+			},
 			"details": errors,
 		})
 		return
 	}
 
 	// Save
-	if err := s.storage.Save(r.Context(), entity, id, data); err != nil {
+	if err := store.Save(r.Context(), entity, id, data); err != nil {
 		s.logger.Error().Err(err).Msg("Failed to save entity")
-		s.writeError(w, http.StatusInternalServerError, "Failed to save entity")
+		s.writeError(w, http.StatusInternalServerError, oluerr.ErrStorageFailed, "Failed to save entity")
 		return
 	}
 
 	// Update graph
-	if s.config.GraphEnabled {
-		if err := s.graph.UpdateFromEntity(entity, id, data); err != nil {
-			s.logger.Error().Err(err).Msg("Failed to update graph")
-		}
-		if s.persister != nil {
-			s.persister.MarkDirty()
-		}
-	}
+	s.updateGraph(r.Context(), entity, id, data)
 
-	s.invalidateCache(entity)
+	s.invalidateCacheForID(r.Context(), entity, id)
 	s.logger.Info().Str("entity", entity).Int("id", id).Msg("Saved entity")
 
 	s.writeJSON(w, http.StatusCreated, map[string]interface{}{
@@ -259,7 +259,7 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 // handleGraphPath finds a path between two nodes
 func (s *Server) handleGraphPath(w http.ResponseWriter, r *http.Request) {
 	if !s.config.GraphEnabled {
-		s.writeError(w, http.StatusNotImplemented, "Graph operations are disabled")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrGraphDisabled, "Graph operations are disabled")
 		return
 	}
 
@@ -269,8 +269,7 @@ func (s *Server) handleGraphPath(w http.ResponseWriter, r *http.Request) {
 		MaxDepth int    `json:"max_depth"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -280,7 +279,7 @@ func (s *Server) handleGraphPath(w http.ResponseWriter, r *http.Request) {
 
 	path, err := s.graph.FindPath(req.From, req.To, req.MaxDepth)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, err.Error())
+		s.writeError(w, http.StatusNotFound, oluerr.ErrEntityNotFound, err.Error())
 		return
 	}
 
@@ -295,7 +294,7 @@ func (s *Server) handleGraphPath(w http.ResponseWriter, r *http.Request) {
 // handleGraphNeighbors gets neighbors of a node
 func (s *Server) handleGraphNeighbors(w http.ResponseWriter, r *http.Request) {
 	if !s.config.GraphEnabled {
-		s.writeError(w, http.StatusNotImplemented, "Graph operations are disabled")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrGraphDisabled, "Graph operations are disabled")
 		return
 	}
 
@@ -304,8 +303,7 @@ func (s *Server) handleGraphNeighbors(w http.ResponseWriter, r *http.Request) {
 		Direction string `json:"direction"` // "out", "in", or "both"
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -318,7 +316,7 @@ func (s *Server) handleGraphNeighbors(w http.ResponseWriter, r *http.Request) {
 	if req.Direction == "out" || req.Direction == "both" {
 		neighbors, err := s.graph.GetNeighbors(req.NodeID)
 		if err != nil {
-			s.writeError(w, http.StatusInternalServerError, err.Error())
+			s.writeError(w, http.StatusInternalServerError, oluerr.ErrStorageFailed, err.Error())
 			return
 		}
 		result["outgoing"] = neighbors
@@ -327,7 +325,7 @@ func (s *Server) handleGraphNeighbors(w http.ResponseWriter, r *http.Request) {
 	if req.Direction == "in" || req.Direction == "both" {
 		incoming, err := s.graph.GetIncomingEdges(req.NodeID)
 		if err != nil {
-			s.writeError(w, http.StatusInternalServerError, err.Error())
+			s.writeError(w, http.StatusInternalServerError, oluerr.ErrStorageFailed, err.Error())
 			return
 		}
 		result["incoming"] = incoming
@@ -341,7 +339,7 @@ func (s *Server) handleGraphNeighbors(w http.ResponseWriter, r *http.Request) {
 // handleGraphStats returns graph statistics
 func (s *Server) handleGraphStats(w http.ResponseWriter, r *http.Request) {
 	if !s.config.GraphEnabled {
-		s.writeError(w, http.StatusNotImplemented, "Graph operations are disabled")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrGraphDisabled, "Graph operations are disabled")
 		return
 	}
 
@@ -364,25 +362,25 @@ func (s *Server) handleGraphStats(w http.ResponseWriter, r *http.Request) {
 // GET /api/v1/graph/nodes/{node_id}
 func (s *Server) handleGraphNodeInfo(w http.ResponseWriter, r *http.Request) {
 	if !s.config.GraphEnabled {
-		s.writeError(w, http.StatusNotImplemented, "Graph operations are disabled")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrGraphDisabled, "Graph operations are disabled")
 		return
 	}
 
 	nodeID := chi.URLParam(r, "node_id")
 	if nodeID == "" {
-		s.writeError(w, http.StatusBadRequest, "node_id required")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrMissingParam, "node_id required")
 		return
 	}
 
 	ig, ok := s.graph.(*graph.IndexedGraph)
 	if !ok {
-		s.writeError(w, http.StatusInternalServerError, "Graph type not supported")
+		s.writeError(w, http.StatusInternalServerError, oluerr.ErrGraphUnsupported, "Graph type not supported")
 		return
 	}
 
 	info, err := ig.GetNodeInfo(nodeID)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, err.Error())
+		s.writeError(w, http.StatusNotFound, oluerr.ErrEntityNotFound, err.Error())
 		return
 	}
 
@@ -393,25 +391,25 @@ func (s *Server) handleGraphNodeInfo(w http.ResponseWriter, r *http.Request) {
 // GET /api/v1/graph/nodes/{node_id}/degree
 func (s *Server) handleGraphNodeDegree(w http.ResponseWriter, r *http.Request) {
 	if !s.config.GraphEnabled {
-		s.writeError(w, http.StatusNotImplemented, "Graph operations are disabled")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrGraphDisabled, "Graph operations are disabled")
 		return
 	}
 
 	nodeID := chi.URLParam(r, "node_id")
 	if nodeID == "" {
-		s.writeError(w, http.StatusBadRequest, "node_id required")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrMissingParam, "node_id required")
 		return
 	}
 
 	ig, ok := s.graph.(*graph.IndexedGraph)
 	if !ok {
-		s.writeError(w, http.StatusInternalServerError, "Graph type not supported")
+		s.writeError(w, http.StatusInternalServerError, oluerr.ErrGraphUnsupported, "Graph type not supported")
 		return
 	}
 
 	degree, err := ig.GetDegree(nodeID)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, err.Error())
+		s.writeError(w, http.StatusNotFound, oluerr.ErrEntityNotFound, err.Error())
 		return
 	}
 
@@ -425,19 +423,19 @@ func (s *Server) handleGraphNodeDegree(w http.ResponseWriter, r *http.Request) {
 // GET /api/v1/graph/{node_id}/in
 func (s *Server) handleGraphIncoming(w http.ResponseWriter, r *http.Request) {
 	if !s.config.GraphEnabled {
-		s.writeError(w, http.StatusNotImplemented, "Graph operations are disabled")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrGraphDisabled, "Graph operations are disabled")
 		return
 	}
 
 	nodeID := chi.URLParam(r, "node_id")
 	if nodeID == "" {
-		s.writeError(w, http.StatusBadRequest, "node_id required")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrMissingParam, "node_id required")
 		return
 	}
 
 	incoming, err := s.graph.GetIncomingEdges(nodeID)
 	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, err.Error())
+		s.writeError(w, http.StatusInternalServerError, oluerr.ErrStorageFailed, err.Error())
 		return
 	}
 
@@ -462,19 +460,19 @@ func (s *Server) handleGraphIncoming(w http.ResponseWriter, r *http.Request) {
 // GET /api/v1/graph/{node_id}/out
 func (s *Server) handleGraphOutgoing(w http.ResponseWriter, r *http.Request) {
 	if !s.config.GraphEnabled {
-		s.writeError(w, http.StatusNotImplemented, "Graph operations are disabled")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrGraphDisabled, "Graph operations are disabled")
 		return
 	}
 
 	nodeID := chi.URLParam(r, "node_id")
 	if nodeID == "" {
-		s.writeError(w, http.StatusBadRequest, "node_id required")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrMissingParam, "node_id required")
 		return
 	}
 
 	outgoing, err := s.graph.GetNeighbors(nodeID)
 	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, err.Error())
+		s.writeError(w, http.StatusInternalServerError, oluerr.ErrStorageFailed, err.Error())
 		return
 	}
 
@@ -499,7 +497,7 @@ func (s *Server) handleGraphOutgoing(w http.ResponseWriter, r *http.Request) {
 // POST /api/v1/graph/shortestPath
 func (s *Server) handleGraphShortestPath(w http.ResponseWriter, r *http.Request) {
 	if !s.config.GraphEnabled {
-		s.writeError(w, http.StatusNotImplemented, "Graph operations are disabled")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrGraphDisabled, "Graph operations are disabled")
 		return
 	}
 
@@ -509,13 +507,12 @@ func (s *Server) handleGraphShortestPath(w http.ResponseWriter, r *http.Request)
 		MaxDepth int    `json:"max_depth"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 
 	if req.From == "" || req.To == "" {
-		s.writeError(w, http.StatusBadRequest, "from and to are required")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrMissingParam, "from and to are required")
 		return
 	}
 
@@ -548,7 +545,7 @@ func (s *Server) handleGraphShortestPath(w http.ResponseWriter, r *http.Request)
 // POST /api/v1/graph/pathExists
 func (s *Server) handleGraphPathExists(w http.ResponseWriter, r *http.Request) {
 	if !s.config.GraphEnabled {
-		s.writeError(w, http.StatusNotImplemented, "Graph operations are disabled")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrGraphDisabled, "Graph operations are disabled")
 		return
 	}
 
@@ -558,13 +555,12 @@ func (s *Server) handleGraphPathExists(w http.ResponseWriter, r *http.Request) {
 		MaxDepth int    `json:"max_depth"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 
 	if req.From == "" || req.To == "" {
-		s.writeError(w, http.StatusBadRequest, "from and to are required")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrMissingParam, "from and to are required")
 		return
 	}
 
@@ -574,13 +570,13 @@ func (s *Server) handleGraphPathExists(w http.ResponseWriter, r *http.Request) {
 
 	ig, ok := s.graph.(*graph.IndexedGraph)
 	if !ok {
-		s.writeError(w, http.StatusInternalServerError, "Graph type not supported")
+		s.writeError(w, http.StatusInternalServerError, oluerr.ErrGraphUnsupported, "Graph type not supported")
 		return
 	}
 
 	exists, length, err := ig.PathExists(req.From, req.To, req.MaxDepth)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, err.Error())
+		s.writeError(w, http.StatusNotFound, oluerr.ErrEntityNotFound, err.Error())
 		return
 	}
 
@@ -596,7 +592,7 @@ func (s *Server) handleGraphPathExists(w http.ResponseWriter, r *http.Request) {
 // POST /api/v1/graph/commonNeighbors
 func (s *Server) handleGraphCommonNeighbors(w http.ResponseWriter, r *http.Request) {
 	if !s.config.GraphEnabled {
-		s.writeError(w, http.StatusNotImplemented, "Graph operations are disabled")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrGraphDisabled, "Graph operations are disabled")
 		return
 	}
 
@@ -605,25 +601,24 @@ func (s *Server) handleGraphCommonNeighbors(w http.ResponseWriter, r *http.Reque
 		NodeB string `json:"node_b"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 
 	if req.NodeA == "" || req.NodeB == "" {
-		s.writeError(w, http.StatusBadRequest, "node_a and node_b are required")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrMissingParam, "node_a and node_b are required")
 		return
 	}
 
 	ig, ok := s.graph.(*graph.IndexedGraph)
 	if !ok {
-		s.writeError(w, http.StatusInternalServerError, "Graph type not supported")
+		s.writeError(w, http.StatusInternalServerError, oluerr.ErrGraphUnsupported, "Graph type not supported")
 		return
 	}
 
 	common, err := ig.CommonNeighbors(req.NodeA, req.NodeB)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, err.Error())
+		s.writeError(w, http.StatusNotFound, oluerr.ErrEntityNotFound, err.Error())
 		return
 	}
 
@@ -643,7 +638,7 @@ func (s *Server) handleGraphCommonNeighbors(w http.ResponseWriter, r *http.Reque
 // POST /api/v1/graph/nodes/search
 func (s *Server) handleGraphNodeSearch(w http.ResponseWriter, r *http.Request) {
 	if !s.config.GraphEnabled {
-		s.writeError(w, http.StatusNotImplemented, "Graph operations are disabled")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrGraphDisabled, "Graph operations are disabled")
 		return
 	}
 
@@ -652,14 +647,13 @@ func (s *Server) handleGraphNodeSearch(w http.ResponseWriter, r *http.Request) {
 		Limit  int    `json:"limit"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 
 	ig, ok := s.graph.(*graph.IndexedGraph)
 	if !ok {
-		s.writeError(w, http.StatusInternalServerError, "Graph type not supported")
+		s.writeError(w, http.StatusInternalServerError, oluerr.ErrGraphUnsupported, "Graph type not supported")
 		return
 	}
 
@@ -687,12 +681,12 @@ func (s *Server) handleGraphNodeSearch(w http.ResponseWriter, r *http.Request) {
 // POST /api/v1/graph/query
 func (s *Server) handleSulpherQuery(w http.ResponseWriter, r *http.Request) {
 	if !s.config.GraphEnabled {
-		s.writeError(w, http.StatusNotImplemented, "Graph operations are disabled")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrGraphDisabled, "Graph operations are disabled")
 		return
 	}
 
 	if s.sulpherJobs == nil {
-		s.writeError(w, http.StatusNotImplemented, "Sulpher query engine not initialized")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrQueryEngineNotInit, "Sulpher query engine not initialized")
 		return
 	}
 
@@ -701,13 +695,12 @@ func (s *Server) handleSulpherQuery(w http.ResponseWriter, r *http.Request) {
 		MaxDepth int    `json:"max_depth"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 
 	if req.Query == "" {
-		s.writeError(w, http.StatusBadRequest, "Query is required")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrQueryRequired, "Query is required")
 		return
 	}
 
@@ -715,13 +708,34 @@ func (s *Server) handleSulpherQuery(w http.ResponseWriter, r *http.Request) {
 		req.MaxDepth = s.config.MaxQueryDepth
 	}
 
-	result, err := s.sulpherJobs.ExecuteSync(req.Query, req.MaxDepth)
+	// Enforce server-side query timeout via context
+	timeout := time.Duration(s.config.QueryTimeout) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+
+	result, err := s.sulpherJobs.ExecuteSync(ctx, req.Query, req.MaxDepth)
 	if err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		code := oluerr.ErrGraphFailed
+		status := http.StatusBadRequest
+		if ctx.Err() != nil {
+			code = oluerr.ErrQueryTimeout
+			status = http.StatusGatewayTimeout
+		} else if errors.Is(err, sulpher.ErrVisitedNodeLimit) {
+			code = oluerr.ErrGraphVisitedLimit
+			status = http.StatusRequestEntityTooLarge
+		} else if errors.Is(err, sulpher.ErrResultLimit) {
+			code = oluerr.ErrGraphResultLimit
+			status = http.StatusRequestEntityTooLarge
+		}
+		s.writeError(w, status, code, err.Error())
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	// Enforce response size limit
+	response := map[string]interface{}{
 		"status": "completed",
 		"result": result.Data,
 		"stats": map[string]interface{}{
@@ -729,19 +743,49 @@ func (s *Server) handleSulpherQuery(w http.ResponseWriter, r *http.Request) {
 			"paths_found":       result.Stats.PathsFound,
 			"execution_time_ms": result.Stats.ExecutionTime.Milliseconds(),
 		},
-	})
+	}
+
+	maxBytes := s.config.QueryMaxResponseBytes
+	if maxBytes <= 0 {
+		maxBytes = 10 * 1024 * 1024
+	}
+	encoded, jsonErr := json.Marshal(response)
+	if jsonErr != nil {
+		s.writeError(w, http.StatusInternalServerError, oluerr.ErrQueryFailed, "failed to encode response")
+		return
+	}
+	if len(encoded) > maxBytes {
+		s.writeError(w, http.StatusRequestEntityTooLarge, oluerr.ErrQueryResponseSize,
+			fmt.Sprintf("response too large: %d bytes (max %d)", len(encoded), maxBytes))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(encoded)
+
+	// Log slow queries
+	if result.Stats.ExecutionTime > 5*time.Second {
+		s.logger.Warn().
+			Str("type", "sulpher").
+			Int64("duration_ms", result.Stats.ExecutionTime.Milliseconds()).
+			Int("nodes_traversed", result.Stats.NodesTraversed).
+			Int("paths_found", result.Stats.PathsFound).
+			Int("response_bytes", len(encoded)).
+			Msg("Slow query")
+	}
 }
 
 // handleSulpherQueryAsync submits a Sulpher query for async execution
 // POST /api/v1/graph/query/async
 func (s *Server) handleSulpherQueryAsync(w http.ResponseWriter, r *http.Request) {
 	if !s.config.GraphEnabled {
-		s.writeError(w, http.StatusNotImplemented, "Graph operations are disabled")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrGraphDisabled, "Graph operations are disabled")
 		return
 	}
 
 	if s.sulpherJobs == nil {
-		s.writeError(w, http.StatusNotImplemented, "Sulpher query engine not initialized")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrQueryEngineNotInit, "Sulpher query engine not initialized")
 		return
 	}
 
@@ -750,13 +794,12 @@ func (s *Server) handleSulpherQueryAsync(w http.ResponseWriter, r *http.Request)
 		MaxDepth int    `json:"max_depth"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 
 	if req.Query == "" {
-		s.writeError(w, http.StatusBadRequest, "Query is required")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrQueryRequired, "Query is required")
 		return
 	}
 
@@ -766,7 +809,7 @@ func (s *Server) handleSulpherQueryAsync(w http.ResponseWriter, r *http.Request)
 
 	job, err := s.sulpherJobs.Submit(req.Query, req.MaxDepth)
 	if err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrInvalidEntity, err.Error())
 		return
 	}
 
@@ -781,24 +824,24 @@ func (s *Server) handleSulpherQueryAsync(w http.ResponseWriter, r *http.Request)
 // GET /api/v1/graph/query/{query_id}
 func (s *Server) handleSulpherQueryStatus(w http.ResponseWriter, r *http.Request) {
 	if !s.config.GraphEnabled {
-		s.writeError(w, http.StatusNotImplemented, "Graph operations are disabled")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrGraphDisabled, "Graph operations are disabled")
 		return
 	}
 
 	if s.sulpherJobs == nil {
-		s.writeError(w, http.StatusNotImplemented, "Sulpher query engine not initialized")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrQueryEngineNotInit, "Sulpher query engine not initialized")
 		return
 	}
 
 	queryID := chi.URLParam(r, "query_id")
 	if queryID == "" {
-		s.writeError(w, http.StatusBadRequest, "query_id required")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrMissingParam, "query_id required")
 		return
 	}
 
 	job, exists := s.sulpherJobs.GetJob(queryID)
 	if !exists {
-		s.writeError(w, http.StatusNotFound, "Query not found")
+		s.writeError(w, http.StatusNotFound, oluerr.ErrQueryNotFound, "Query not found")
 		return
 	}
 
@@ -826,24 +869,24 @@ func (s *Server) handleSulpherQueryStatus(w http.ResponseWriter, r *http.Request
 // GET /api/v1/graph/query/{query_id}/result
 func (s *Server) handleSulpherQueryResult(w http.ResponseWriter, r *http.Request) {
 	if !s.config.GraphEnabled {
-		s.writeError(w, http.StatusNotImplemented, "Graph operations are disabled")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrGraphDisabled, "Graph operations are disabled")
 		return
 	}
 
 	if s.sulpherJobs == nil {
-		s.writeError(w, http.StatusNotImplemented, "Sulpher query engine not initialized")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrQueryEngineNotInit, "Sulpher query engine not initialized")
 		return
 	}
 
 	queryID := chi.URLParam(r, "query_id")
 	if queryID == "" {
-		s.writeError(w, http.StatusBadRequest, "query_id required")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrMissingParam, "query_id required")
 		return
 	}
 
 	job, exists := s.sulpherJobs.GetJob(queryID)
 	if !exists {
-		s.writeError(w, http.StatusNotFound, "Query not found")
+		s.writeError(w, http.StatusNotFound, oluerr.ErrQueryNotFound, "Query not found")
 		return
 	}
 
@@ -883,9 +926,10 @@ func (s *Server) handleSulpherQueryResult(w http.ResponseWriter, r *http.Request
 
 // handleOQLQuery executes an OQL query synchronously
 // POST /api/v1/oql/query
+// POST /api/v1/tenant/{tenant_id}/oql/query
 func (s *Server) handleOQLQuery(w http.ResponseWriter, r *http.Request) {
 	if s.oqlJobs == nil {
-		s.writeError(w, http.StatusNotImplemented, "OQL query engine not initialized")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrQueryEngineNotInit, "OQL query engine not initialized")
 		return
 	}
 
@@ -893,23 +937,44 @@ func (s *Server) handleOQLQuery(w http.ResponseWriter, r *http.Request) {
 		Query string `json:"query"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 
 	if req.Query == "" {
-		s.writeError(w, http.StatusBadRequest, "Query is required")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrQueryRequired, "Query is required")
 		return
 	}
 
-	result, err := s.oqlJobs.ExecuteSync(r.Context(), req.Query)
+	// Enforce server-side query timeout
+	timeout := time.Duration(s.config.QueryTimeout) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+
+	// Execute using tenant-scoped store
+	store := s.getStore(r.Context())
+	result, err := s.oqlJobs.ExecuteSyncWithStore(ctx, req.Query, store)
 	if err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		code := oluerr.ErrQueryFailed
+		status := http.StatusBadRequest
+		if ctx.Err() != nil {
+			code = oluerr.ErrQueryTimeout
+			status = http.StatusGatewayTimeout
+		} else if errors.Is(err, oql.ErrScanLimit) {
+			code = oluerr.ErrQueryScanLimit
+			status = http.StatusRequestEntityTooLarge
+		} else if errors.Is(err, oql.ErrResultLimit) {
+			code = oluerr.ErrQueryRowLimit
+			status = http.StatusRequestEntityTooLarge
+		}
+		s.writeError(w, status, code, err.Error())
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	response := map[string]interface{}{
 		"status": "completed",
 		"data":   result.Rows,
 		"stats": map[string]interface{}{
@@ -918,14 +983,45 @@ func (s *Server) handleOQLQuery(w http.ResponseWriter, r *http.Request) {
 			"rows_affected":     result.Stats.RowsAffected,
 			"execution_time_ms": result.Stats.ExecutionTime.Milliseconds(),
 		},
-	})
+	}
+
+	// Enforce response size limit
+	maxBytes := s.config.QueryMaxResponseBytes
+	if maxBytes <= 0 {
+		maxBytes = 10 * 1024 * 1024 // 10 MB default
+	}
+	encoded, jsonErr := json.Marshal(response)
+	if jsonErr != nil {
+		s.writeError(w, http.StatusInternalServerError, oluerr.ErrQueryFailed, "failed to encode response")
+		return
+	}
+	if len(encoded) > maxBytes {
+		s.writeError(w, http.StatusRequestEntityTooLarge, oluerr.ErrQueryResponseSize,
+			fmt.Sprintf("response too large: %d bytes (max %d)", len(encoded), maxBytes))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(encoded)
+
+	// Log slow queries
+	if result.Stats.ExecutionTime > 5*time.Second {
+		s.logger.Warn().
+			Str("type", "oql").
+			Int64("duration_ms", result.Stats.ExecutionTime.Milliseconds()).
+			Int("rows_scanned", result.Stats.RowsScanned).
+			Int("rows_returned", result.Stats.RowsReturned).
+			Int("response_bytes", len(encoded)).
+			Msg("Slow query")
+	}
 }
 
 // handleOQLQueryAsync submits an OQL query for async execution
 // POST /api/v1/oql/query/async
 func (s *Server) handleOQLQueryAsync(w http.ResponseWriter, r *http.Request) {
 	if s.oqlJobs == nil {
-		s.writeError(w, http.StatusNotImplemented, "OQL query engine not initialized")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrQueryEngineNotInit, "OQL query engine not initialized")
 		return
 	}
 
@@ -933,17 +1029,19 @@ func (s *Server) handleOQLQueryAsync(w http.ResponseWriter, r *http.Request) {
 		Query string `json:"query"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 
 	if req.Query == "" {
-		s.writeError(w, http.StatusBadRequest, "Query is required")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrQueryRequired, "Query is required")
 		return
 	}
 
-	queryID := s.oqlJobs.Submit(req.Query)
+	// Capture the tenant-scoped store so the background goroutine
+	// executes against the correct tenant, not the default store.
+	store := s.getStore(r.Context())
+	queryID := s.oqlJobs.Submit(req.Query, store)
 
 	s.writeJSON(w, http.StatusAccepted, map[string]interface{}{
 		"query_id": queryID,
@@ -955,19 +1053,19 @@ func (s *Server) handleOQLQueryAsync(w http.ResponseWriter, r *http.Request) {
 // GET /api/v1/oql/query/{query_id}
 func (s *Server) handleOQLQueryStatus(w http.ResponseWriter, r *http.Request) {
 	if s.oqlJobs == nil {
-		s.writeError(w, http.StatusNotImplemented, "OQL query engine not initialized")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrQueryEngineNotInit, "OQL query engine not initialized")
 		return
 	}
 
 	queryID := chi.URLParam(r, "query_id")
 	if queryID == "" {
-		s.writeError(w, http.StatusBadRequest, "query_id required")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrMissingParam, "query_id required")
 		return
 	}
 
 	job := s.oqlJobs.GetJob(queryID)
 	if job == nil {
-		s.writeError(w, http.StatusNotFound, "Query not found")
+		s.writeError(w, http.StatusNotFound, oluerr.ErrQueryNotFound, "Query not found")
 		return
 	}
 
@@ -990,19 +1088,19 @@ func (s *Server) handleOQLQueryStatus(w http.ResponseWriter, r *http.Request) {
 // GET /api/v1/oql/query/{query_id}/result
 func (s *Server) handleOQLQueryResult(w http.ResponseWriter, r *http.Request) {
 	if s.oqlJobs == nil {
-		s.writeError(w, http.StatusNotImplemented, "OQL query engine not initialized")
+		s.writeError(w, http.StatusNotImplemented, oluerr.ErrQueryEngineNotInit, "OQL query engine not initialized")
 		return
 	}
 
 	queryID := chi.URLParam(r, "query_id")
 	if queryID == "" {
-		s.writeError(w, http.StatusBadRequest, "query_id required")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrMissingParam, "query_id required")
 		return
 	}
 
 	job := s.oqlJobs.GetJob(queryID)
 	if job == nil {
-		s.writeError(w, http.StatusNotFound, "Query not found")
+		s.writeError(w, http.StatusNotFound, oluerr.ErrQueryNotFound, "Query not found")
 		return
 	}
 
@@ -1042,20 +1140,33 @@ func (s *Server) handleCreateSchema(w http.ResponseWriter, r *http.Request) {
 	entity := chi.URLParam(r, "entity")
 
 	if err := validateEntityName(entity); err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrInvalidEntity, err.Error())
 		return
 	}
 
 	var schema map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&schema); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
+	if !s.decodeJSON(w, r, &schema) {
 		return
 	}
 
 	if err := s.validator.LoadSchema(entity, schema); err != nil {
 		s.logger.Error().Err(err).Msg("Failed to load schema")
-		s.writeError(w, http.StatusInternalServerError, "Failed to load schema")
+		s.writeError(w, http.StatusInternalServerError, oluerr.ErrSchemaLoadFailed, "Failed to load schema")
 		return
+	}
+
+	// Register adapted table if the store supports it.
+	// This creates or updates the optimised column-per-field table
+	// for this entity, enabling direct SQL queries instead of JSON
+	// blob extraction.
+	if sqlStore, ok := s.storage.(*storage.SQLiteStore); ok {
+		if err := sqlStore.RegisterAdaptedEntity(r.Context(), entity, schema); err != nil {
+			s.logger.Error().Err(err).Str("entity", entity).Msg("Failed to register adapted table")
+			s.writeError(w, http.StatusInternalServerError, oluerr.ErrStorageFailed,
+				"Schema loaded but adapted table registration failed")
+			return
+		}
+		s.logger.Info().Str("entity", entity).Msg("Registered adapted table")
 	}
 
 	s.logger.Info().Str("entity", entity).Msg("Created/updated schema")
@@ -1070,18 +1181,18 @@ func (s *Server) handleGetSchema(w http.ResponseWriter, r *http.Request) {
 	entity := chi.URLParam(r, "entity")
 
 	if err := validateEntityName(entity); err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrInvalidEntity, err.Error())
 		return
 	}
 
 	if !s.validator.HasSchema(entity) {
-		s.writeError(w, http.StatusNotFound, fmt.Sprintf("No schema found for %s", entity))
+		s.writeError(w, http.StatusNotFound, oluerr.ErrSchemaNotFound, fmt.Sprintf("No schema found for %s", entity))
 		return
 	}
 
 	schema, err := s.validator.GetSchema(entity)
 	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve schema")
+		s.writeError(w, http.StatusInternalServerError, oluerr.ErrSchemaLoadFailed, "Failed to retrieve schema")
 		return
 	}
 
@@ -1096,30 +1207,72 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, data interface{}) 
 	_ = json.NewEncoder(w).Encode(data)
 }
 
-func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
+func (s *Server) writeError(w http.ResponseWriter, status int, code oluerr.Code, message string) {
 	s.writeJSON(w, status, models.ErrorResponse{
 		Error: struct {
+			Code    string `json:"code"`
 			Message string `json:"message"`
 			Status  int    `json:"status"`
 		}{
+			Code:    string(code),
 			Message: message,
 			Status:  status,
 		},
 	})
 }
 
-func (s *Server) invalidateCache(entity string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+// decodeJSON reads and decodes JSON from the request body. It returns true
+// on success. On failure it writes the appropriate error response (413 for
+// oversized bodies, 400 for malformed JSON) and returns false.
+func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, dst interface{}) bool {
+	err := json.NewDecoder(r.Body).Decode(dst)
+	if err == nil {
+		return true
+	}
+	// MaxBytesReader wraps the body and returns a MaxBytesError when the
+	// limit is exceeded. Detect this and return 413.
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		s.writeError(w, http.StatusRequestEntityTooLarge, oluerr.ErrEntityTooLarge, "Request body too large")
+		return false
+	}
+	s.writeError(w, http.StatusBadRequest, oluerr.ErrInvalidJSON, "Invalid JSON")
+	return false
+}
+
+func (s *Server) invalidateCache(ctx context.Context, entity string) {
+	cacheCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_ = s.cache.DeletePattern(ctx, entity)
+	tid := getTenantIDNumeric(ctx)
+	pattern := tenant.CachePattern(tid, entity)
+	_ = s.cache.DeletePattern(cacheCtx, pattern)
+}
+
+// invalidateCacheForID removes the individual GET cache entry for a specific
+// entity instance, plus all list caches for the entity type (since lists
+// include the modified record). Unlike invalidateCache, this preserves GET
+// cache entries for other entity instances of the same type.
+func (s *Server) invalidateCacheForID(ctx context.Context, entity string, id int) {
+	cacheCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tid := getTenantIDNumeric(ctx)
+
+	// Delete the individual entity cache entry
+	key := tenant.CacheKey(tid, entity, id)
+	_ = s.cache.Delete(cacheCtx, key)
+
+	// Invalidate list caches (since the list contents changed)
+	listPattern := tenant.CacheListPattern(tid, entity)
+	_ = s.cache.DeletePattern(cacheCtx, listPattern)
 }
 
 // handleFullTextSearch performs full-text search across entities
 func (s *Server) handleFullTextSearch(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query().Get("q")
 	if query == "" {
-		s.writeError(w, http.StatusBadRequest, "Missing 'q' query parameter")
+		s.writeError(w, http.StatusBadRequest, oluerr.ErrMissingParam, "Missing 'q' query parameter")
 		return
 	}
 
@@ -1127,14 +1280,15 @@ func (s *Server) handleFullTextSearch(w http.ResponseWriter, r *http.Request) {
 
 	// Check if full-text search is enabled
 	if !s.config.FullTextEnabled {
-		s.writeError(w, http.StatusServiceUnavailable, "Full-text search is not enabled")
+		s.writeError(w, http.StatusServiceUnavailable, oluerr.ErrSearchDisabled, "Full-text search is not enabled")
 		return
 	}
 
-	results, err := s.storage.FullTextSearch(r.Context(), query, entity)
+	store := s.getStore(r.Context())
+	results, err := store.FullTextSearch(r.Context(), query, entity)
 	if err != nil {
 		s.logger.Error().Err(err).Str("query", query).Msg("Full-text search failed")
-		s.writeError(w, http.StatusInternalServerError, "Search failed")
+		s.writeError(w, http.StatusInternalServerError, oluerr.ErrSearchFailed, "Search failed")
 		return
 	}
 
@@ -1167,7 +1321,8 @@ func (s *Server) embedValue(ctx context.Context, v interface{}, depth int) inter
 
 	// Check if it's a REF
 	if ref, isRef := models.IsReference(v); isRef {
-		if refData, err := s.storage.Get(ctx, ref.Entity, ref.ID); err == nil {
+		store := s.getStore(ctx)
+		if refData, err := store.Get(ctx, ref.Entity, ref.ID); err == nil {
 			return s.embedReferences(ctx, refData, depth-1)
 		}
 		return v
@@ -1222,16 +1377,14 @@ func (s *Server) cascadeDelete(ctx context.Context, entity string, id int) ([]st
 		// This would require scanning all entities - simplified here
 
 		// Delete the entity
-		if err := s.storage.Delete(ctx, current.entity, current.id); err != nil {
+		store := s.getStore(ctx)
+		if err := store.Delete(ctx, current.entity, current.id); err != nil {
 			s.logger.Error().Err(err).Str("entity", current.entity).Int("id", current.id).
 				Msg("Failed to delete during cascade")
 		}
 
 		// Remove from graph
-		if s.config.GraphEnabled {
-			nodeID := fmt.Sprintf("%s:%d", current.entity, current.id)
-			_ = s.graph.RemoveNode(nodeID)
-		}
+		s.removeGraph(ctx, current.entity, current.id)
 	}
 
 	if s.config.GraphEnabled && s.persister != nil {
@@ -1251,6 +1404,24 @@ func validateEntityName(entity string) error {
 		return fmt.Errorf("invalid entity name: must start with a letter and contain only letters, numbers, and underscores")
 	}
 
+	return nil
+}
+
+// validateFieldName checks that a filter field name is safe for use in
+// json_extract SQL paths. Allows dotted paths for nested fields (e.g.
+// "address.city") where each segment matches the entity name pattern.
+// Rejects anything that could be used for SQL injection.
+func validateFieldName(field string) error {
+	if field == "" {
+		return fmt.Errorf("field name cannot be empty")
+	}
+	segments := strings.Split(field, ".")
+	for _, seg := range segments {
+		matched, _ := regexp.MatchString(`^[a-zA-Z][a-zA-Z0-9_]*$`, seg)
+		if !matched {
+			return fmt.Errorf("invalid field name %q: each segment must start with a letter and contain only letters, numbers, and underscores", field)
+		}
+	}
 	return nil
 }
 
@@ -1278,6 +1449,14 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 
 	// Add SQLite database if using sqlite storage
 	if s.config.StorageType == "sqlite" {
+		// Checkpoint the WAL so all data is in the main database file.
+		// Without this, recent writes may only exist in the WAL and
+		// the exported .db file would be missing data.
+		if sqlStore, ok := s.storage.(*storage.SQLiteStore); ok {
+			if _, err := sqlStore.DB().ExecContext(r.Context(), "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+				s.logger.Warn().Err(err).Msg("WAL checkpoint before export failed")
+			}
+		}
 		dbPath := s.config.DBPath
 		if err := s.addFileToZip(zw, dbPath, "entities.db"); err != nil {
 			s.logger.Error().Err(err).Str("path", dbPath).Msg("Failed to add database to export")
