@@ -2,6 +2,7 @@
 *Olu* has been discontinued, no further work is going to be done on this project.
 
 Olu is superseded by *Xolu*, a more advanced implementation following and extending the Olu philosophy
+
 https://github.com/ha1tch/xolu
 
 Xolu doesn't support the JSON filestore anymore, but it comes with expanded functionality:
