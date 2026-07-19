@@ -1,10 +1,11 @@
 ## ATTENTION
-*Olu* has been discontinued, no further work is going to be done to this project.
+*Olu* has been discontinued, no further work is going to be done on this project.
 
-Olu is superseded by *Xolu*
+Olu is superseded by *Xolu*, a more advanced implementation following and extending the Olu philosophy
 https://github.com/ha1tch/xolu
 
-Xolu doesn't support the JSON filestore anymore, but it comes with greatly expanded functionality for:
+Xolu doesn't support the JSON filestore anymore, but it comes with expanded functionality:
+
 - greatly improved graph query language, Sulpher now implements a great part of Open Cypher 9
 - OQL queries are now optimised with a query planner, pushdowns, and it covers a more extended subset of SQL
 - 4600+ tests:  unit, regression, e2e, benchmarks, etc.
@@ -12,7 +13,8 @@ Xolu doesn't support the JSON filestore anymore, but it comes with greatly expan
 - calendar / allocation primitives highly optimised
 - FSMs are part of the substrate, guards are SQL WHERE expressions
 - blobs store binary files, with hashes, optionally retrievable throuh a S3-compatible api
-... and a whole lot more
+
+ ...and a whole lot more
 
 There's really no good reason to use the deprecated Olu other than possibly the file-based JSON store, if you absolutely need the practical ease of just inspecting a JSON file when you need to look into a JSON document.  If you only need that, you can still use Olu for that particular feature, and if you need that feature it's unlikely you need the rest of the more advanced features.
 
