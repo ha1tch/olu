@@ -15,6 +15,7 @@ Xolu doesn't support the JSON filestore anymore, but it comes with expanded func
 - FSMs are part of the substrate, guards are SQL WHERE expressions
 - blobs store binary files, with hashes, optionally exposing a S3-compatible api
 - events can be fired by database and fsm actions, triggering requests to webhooks
+- binary builds for the 15 most popular architecture/platform pairs
 
  ...and a whole lot more
 
